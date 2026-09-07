@@ -1,0 +1,9 @@
+dataset: movielens-100k-dev
+seed: 42
+epochs: 1
+tokenizer_epochs: 3
+dimension: 32
+batch_size: 128
+encoder: hash
+cold_fraction: 0.15
+evaluation_limit: 32

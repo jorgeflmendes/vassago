@@ -1,0 +1,8 @@
+cff-version: 1.2.0
+message: Cite the software version and commit used; there is no published VASSAGO paper.
+title: 'VASSAGO: Temporal Candidate-Conditioned Evidence for Sequential Recommendation'
+type: software
+authors:
+  - name: VASSAGO contributors
+version: 0.1.0
+license: PolyForm-Strict-1.0.0

@@ -1,0 +1,15 @@
+name: Deterministic CPU reproduction
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  repeat:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: '0.11.26'
+      - run: uv sync --frozen --python 3.12
+      - run: uv run pytest -q tests/test_reproducibility.py

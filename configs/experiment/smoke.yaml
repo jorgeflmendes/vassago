@@ -1,0 +1,8 @@
+dataset: synthetic
+seed: 42
+epochs: 2
+tokenizer_epochs: 10
+dimension: 32
+batch_size: 64
+encoder: hash
+cold_fraction: 0.15
