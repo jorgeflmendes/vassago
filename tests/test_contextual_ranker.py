@@ -1,22 +1,97 @@
+import json
+from pathlib import Path
+from typing import Any
+
 import numpy as np
+import pytest
 import torch
 from torch.nn import functional as F
 
+import vassago.contextual_ranker as contextual_ranker
 from vassago.config import ExperimentConfig
 from vassago.contextual_ranker import (
     ContextualEvidenceRanker,
     _apply_evidence_scale,
+    _config_fingerprint,
     _exclude_seen_all_positions,
     _exclude_seen_selected_positions,
     _fit_context,
     _interpolate_state,
     _query_timestamp_tensor,
+    _read_selection_recipe,
+    _select_evidence_scale,
+    _sequence_tensors_with_timestamps,
+    freeze_selection_recipe,
 )
 
 
 def _model() -> ContextualEvidenceRanker:
     torch.manual_seed(7)
     return ContextualEvidenceRanker(12, 8, 6, 2, 1, 0.0, 4, 4, 0.2)
+
+
+def _persistence_model() -> ContextualEvidenceRanker:
+    torch.manual_seed(7)
+    return ContextualEvidenceRanker(12, 8, 6, 2, 1, 0.0, 4, 4, 0.2, 1, 3)
+
+
+def _velocity_model() -> ContextualEvidenceRanker:
+    torch.manual_seed(7)
+    return ContextualEvidenceRanker(12, 8, 6, 2, 1, 0.0, 4, 4, 0.2, 1, 0, 3)
+
+
+def test_fixed_selection_recipe_requires_a_separate_development_protocol(tmp_path: Path) -> None:
+    recipe_path = tmp_path / "recipe.json"
+    config = ExperimentConfig()
+    recipe_path.write_text(
+        f"""{{
+  "schema_version": 1,
+  "source_protocol_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "selected_base_epoch": 2,
+  "selected_context_epoch": 1,
+  "selected_joint_epoch": 0,
+  "selected_evidence_scale": 1.0,
+  "selected_original_weight": 1.0,
+  "config_fingerprint": "{_config_fingerprint(config)}"
+}}
+"""
+    )
+    assert _read_selection_recipe(recipe_path, "b" * 64, config).selected_base_epoch == 2
+    assert _read_selection_recipe(
+        recipe_path, "b" * 64, config.model_copy(update={"seed": 43})
+    ).selected_base_epoch == 2
+    with pytest.raises(ValueError, match="separate development"):
+        _read_selection_recipe(recipe_path, "a" * 64, config)
+    with pytest.raises(ValueError, match="configured architecture"):
+        _read_selection_recipe(recipe_path, "b" * 64, ExperimentConfig(dimension=16))
+
+
+def test_freeze_selection_recipe_requires_test_blind_matching_validation(tmp_path: Path) -> None:
+    config = ExperimentConfig()
+    manifest_path = tmp_path / "selection.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "status": "completed",
+                "test_evaluated": False,
+                "protocol_hash": "a" * 64,
+                "config": config.model_dump(),
+                "selected_base_epoch": 2,
+                "selected_context_epoch": 1,
+                "selected_joint_epoch": 0,
+                "selected_evidence_scale": 1.0,
+                "selected_original_weight": 1.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    recipe_path = freeze_selection_recipe(manifest_path, config, tmp_path / "recipe.json")
+    assert _read_selection_recipe(recipe_path, "b" * 64, config).selected_base_epoch == 2
+    payload = json.loads(manifest_path.read_text())
+    payload["test_evaluated"] = True
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="test-blind"):
+        freeze_selection_recipe(manifest_path, config, tmp_path / "invalid.json")
 
 
 def test_sampled_scores_match_catalog_scores_for_last_position() -> None:
@@ -30,7 +105,6 @@ def test_sampled_scores_match_catalog_scores_for_last_position() -> None:
     torch.testing.assert_close(contextual[0] * 0.05, full_contextual[0, [4, 5, 6]])
     assert not full_base.requires_grad
     assert not full_contextual.requires_grad
-
 
 def test_contextual_loss_reaches_memory_and_candidate_projections() -> None:
     model = _model().train()
@@ -47,7 +121,6 @@ def test_contextual_loss_reaches_memory_and_candidate_projections() -> None:
     ):
         assert parameter.grad is not None
         assert torch.isfinite(parameter.grad).all()
-
 
 def test_temporal_partition_bounds_contain_exact_evidence() -> None:
     model = _model().eval()
@@ -75,6 +148,139 @@ def test_multiple_evidence_heads_preserve_sampled_catalog_contract() -> None:
     _, sampled = model.sampled_logits(history, targets, negatives, torch.tensor([2]))
     _, catalog = model.score(history)
     torch.testing.assert_close(sampled[0] * 0.05, catalog[0, [4, 5, 6]])
+
+
+def test_persistence_scores_match_catalog_scores() -> None:
+    model = _persistence_model().eval()
+    history = torch.tensor([[1, 2, 3, 0, 0, 0]])
+    timestamps = torch.tensor([[100, 400, 1_000, 0, 0, 0]])
+    targets = torch.tensor([4])
+    negatives = torch.tensor([[5, 6]])
+    _, sampled = model.sampled_logits(
+        history,
+        targets,
+        negatives,
+        torch.tensor([2]),
+        timestamps=timestamps,
+        query_timestamps=timestamps,
+    )
+    _, catalog = model.score(history, timestamps=timestamps, query_timestamps=timestamps)
+    torch.testing.assert_close(sampled[0] * 0.05, catalog[0, [4, 5, 6]])
+
+
+def test_persistence_gradient_reaches_routing_decay_and_decoder() -> None:
+    model = _persistence_model().train()
+    history = torch.tensor([[1, 2, 3, 0, 0, 0]])
+    timestamps = torch.tensor([[100, 400, 1_000, 0, 0, 0]])
+    _, contextual = model.sampled_logits(
+        history,
+        torch.tensor([4]),
+        torch.tensor([[5, 6]]),
+        torch.tensor([2]),
+        timestamps=timestamps,
+        query_timestamps=timestamps,
+    )
+    F.cross_entropy(contextual, torch.zeros(1, dtype=torch.long)).backward()
+    for parameter in (
+        model.persistence_router.weight,
+        model.persistence_candidate_gate.weight,
+        model.persistence_history_gate.weight,
+        model.persistence_half_life_increments,
+        model.persistence_gamma_unconstrained,
+        model.persistence_disagreement_unconstrained,
+    ):
+        assert parameter.grad is not None
+        assert torch.isfinite(parameter.grad).all()
+        assert parameter.grad.abs().sum() > 0
+
+
+def test_persistence_is_invariant_to_an_absolute_timestamp_offset() -> None:
+    model = _persistence_model().eval()
+    history = torch.tensor([[1, 2, 3, 0, 0, 0]])
+    timestamps = torch.tensor([[100, 400, 1_000, 0, 0, 0]])
+    shifted = torch.tensor([[1_100, 1_400, 2_000, 0, 0, 0]])
+    _, original = model.score(history, timestamps=timestamps, query_timestamps=timestamps)
+    _, translated = model.score(history, timestamps=shifted, query_timestamps=shifted)
+    torch.testing.assert_close(original, translated)
+
+
+def test_persistence_disables_evidence_bounds() -> None:
+    with pytest.raises(ValueError, match="persistence scales"):
+        _persistence_model().evidence_bounds(
+            torch.tensor([[1, 2, 3, 0, 0, 0]]), torch.tensor([[4, 5]]), groups=2
+        )
+
+
+def test_persistence_empty_history_has_finite_base_scores() -> None:
+    base, contextual = _persistence_model().eval().score(torch.zeros(1, 6, dtype=torch.long))
+    assert torch.isfinite(contextual).all()
+    torch.testing.assert_close(contextual, base)
+
+
+def test_velocity_scores_match_catalog_scores() -> None:
+    model = _velocity_model().eval()
+    history = torch.tensor([[1, 2, 3, 0, 0, 0]])
+    timestamps = torch.tensor([[100, 400, 1_000, 0, 0, 0]])
+    _, sampled = model.sampled_logits(
+        history,
+        torch.tensor([4]),
+        torch.tensor([[5, 6]]),
+        torch.tensor([2]),
+        timestamps=timestamps,
+        query_timestamps=timestamps,
+    )
+    _, catalog = model.score(history, timestamps=timestamps, query_timestamps=timestamps)
+    torch.testing.assert_close(sampled[0] * 0.05, catalog[0, [4, 5, 6]])
+
+
+def test_velocity_gradient_reaches_track_parameters() -> None:
+    model = _velocity_model().train()
+    history = torch.tensor([[1, 2, 3, 0, 0, 0]])
+    timestamps = torch.tensor([[100, 400, 1_000, 0, 0, 0]])
+    _, contextual = model.sampled_logits(
+        history,
+        torch.tensor([4]),
+        torch.tensor([[5, 6]]),
+        torch.tensor([2]),
+        timestamps=timestamps,
+        query_timestamps=timestamps,
+    )
+    F.cross_entropy(contextual, torch.zeros(1, dtype=torch.long)).backward()
+    for parameter in (
+        model.velocity_router.weight,
+        model.velocity_candidate_gate.weight,
+        model.velocity_history_gate.weight,
+        model.velocity_half_life_increments,
+        model.velocity_gamma_unconstrained,
+    ):
+        assert parameter.grad is not None
+        assert torch.isfinite(parameter.grad).all()
+        assert parameter.grad.abs().sum() > 0
+
+
+def test_velocity_single_event_history_has_finite_scores() -> None:
+    model = _velocity_model().eval()
+    base, contextual = model.score(
+        torch.tensor([[1, 0, 0, 0, 0, 0]]),
+        timestamps=torch.tensor([[100, 0, 0, 0, 0, 0]]),
+    )
+    assert torch.isfinite(contextual).all()
+    torch.testing.assert_close(contextual, base)
+
+
+def test_evidence_scale_selection_uses_registered_ndcg10(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_metrics(*_args: Any, **_kwargs: Any) -> dict[str, float]:
+        scale = float(_args[-1])
+        return {
+            "NDCG@10": {0.5: 0.2, 0.75: 0.3, 1.0: 0.25, 1.25: 0.1, 1.5: 0.1, 2.0: 0.1}[
+                scale
+            ],
+            "Recall@50": float(scale),
+        }
+
+    monkeypatch.setattr(contextual_ranker, "_validation_cutoff_metrics", fake_metrics)
+    selected, _ = _select_evidence_scale(_model(), [], {}, ExperimentConfig())
+    assert selected == 0.75
 
 
 def test_evidence_scale_folds_into_gamma_without_new_parameters() -> None:
@@ -130,13 +336,29 @@ def test_temporal_conditioning_changes_states_and_remains_causal() -> None:
     torch.testing.assert_close(dense_states[:, 0], sparse_states[:, 0])
 
 
-def test_query_timestamp_tensor_shifts_history_and_appends_target_time() -> None:
+def test_query_timestamp_tensor_keeps_causal_times_and_appends_request_time() -> None:
     history_timestamps = torch.tensor([[10, 20, 30, 0], [40, 50, 0, 0]])
     result = _query_timestamp_tensor(
         history_timestamps, torch.tensor([3, 2]), torch.tensor([100, 200])
     )
-    expected = torch.tensor([[20, 30, 100, 0], [50, 200, 0, 0]])
+    expected = torch.tensor([[10, 20, 100, 0], [40, 200, 0, 0]])
     torch.testing.assert_close(result, expected)
+
+
+def test_training_query_times_do_not_use_future_event_timestamps() -> None:
+    rows = [
+        {
+            "items": [1, 2, 3, 4],
+            "timestamps": [10, 20, 30, 40],
+        }
+    ]
+    history, targets, timestamps, query_timestamps = _sequence_tensors_with_timestamps(
+        rows, 4, "cpu"
+    )
+    torch.testing.assert_close(history, torch.tensor([[1, 2, 0, 0]]))
+    torch.testing.assert_close(targets, torch.tensor([[2, 3, 0, 0]]))
+    torch.testing.assert_close(timestamps, torch.tensor([[10, 20, 0, 0]]))
+    torch.testing.assert_close(query_timestamps, timestamps)
 
 
 def test_target_query_time_changes_final_state_without_breaking_causality() -> None:

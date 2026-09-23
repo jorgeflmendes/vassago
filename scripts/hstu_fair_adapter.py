@@ -96,6 +96,22 @@ def _install_fbgemm_fallbacks(torch: Any) -> None:
     torch.ops.fbgemm.dense_to_jagged = dense_to_jagged
 
 
+def _causal_payloads(
+    torch: Any, past_lengths: Any, past_payloads: dict[str, Any]
+) -> dict[str, Any]:
+    timestamps = past_payloads.get("timestamps")
+    if timestamps is None:
+        return past_payloads
+    payloads = dict(past_payloads)
+    causal_timestamps = timestamps.clone()
+    rows = torch.arange(len(causal_timestamps), device=causal_timestamps.device)
+    target_positions = past_lengths.clamp(min=1, max=causal_timestamps.shape[1] - 1)
+    history_positions = (target_positions - 1).clamp_min(0)
+    causal_timestamps[rows, target_positions] = causal_timestamps[rows, history_positions]
+    payloads["timestamps"] = causal_timestamps
+    return payloads
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--upstream", type=Path, required=True)
@@ -115,6 +131,7 @@ def main() -> None:
         action="store_true",
         help="Run the upstream model and evaluator in bfloat16 for serving-memory comparison",
     )
+    parser.add_argument("--profile-repetitions", type=int, default=1)
     parser.add_argument("--epochs", type=int, help="Explicit smoke/debug override")
     parser.add_argument(
         "--capture-top-k",
@@ -172,6 +189,10 @@ def main() -> None:
         parser.error("--model-history-length must be positive")
     if args.capture_top_k < 200:
         parser.error("--capture-top-k must be at least 200")
+    if args.profile_repetitions < 1:
+        parser.error("--profile-repetitions must be positive")
+    if args.profile_repetitions > 1 and checkpoint is None:
+        parser.error("--profile-repetitions above one requires --checkpoint")
     if (
         args.train_history_length is not None
         and args.train_history_length > manifest["history_length"]
@@ -190,8 +211,15 @@ def main() -> None:
     expected_protocol_hash = hashlib.sha256(
         json.dumps(protocol_payload, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
-    if manifest["protocol_hash"] != expected_protocol_hash or manifest["history_length"] != 200:
+    if (
+        manifest.get("schema_version") not in {3, 4}
+        or manifest["protocol_hash"] != expected_protocol_hash
+        or manifest["history_length"] != 200
+    ):
         raise ValueError("HSTU adapter requires a valid 200-item fair protocol")
+    candidate_item_ids = manifest.get("candidate_item_ids") or list(
+        range(1, manifest["item_count"] + 1)
+    )
     if output.exists():
         raise FileExistsError(output)
     upstream_commit = subprocess.run(
@@ -218,7 +246,13 @@ def main() -> None:
     sequence_file = str(protocol_directory / "hstu_sequences.csv")
     if hashlib.sha256(Path(sequence_file).read_bytes()).hexdigest() != manifest["sequence_sha256"]:
         raise ValueError("Protocol sequence artifact has changed")
-    training_sequence_file = Path(sequence_file)
+    training_sequence_file = protocol_directory / "hstu_training_sequences.csv"
+    if manifest.get("training_sequence_sha256") is None:
+        training_sequence_file = Path(sequence_file)
+    elif hashlib.sha256(training_sequence_file.read_bytes()).hexdigest() != manifest[
+        "training_sequence_sha256"
+    ]:
+        raise ValueError("Protocol training sequence artifact has changed")
     temporary_training_file: Path | None = None
     if args.train_history_length is not None:
         temporary_handle = tempfile.NamedTemporaryFile(
@@ -245,7 +279,7 @@ def main() -> None:
             max_sequence_length=max_sequence_length,
             num_unique_items=manifest["item_count"],
             max_item_id=manifest["item_count"],
-            all_item_ids=list(range(1, manifest["item_count"] + 1)),
+            all_item_ids=candidate_item_ids,
             train_dataset=DatasetV2(
                 ratings_file=str(training_sequence_file),
                 **common,
@@ -270,6 +304,15 @@ def main() -> None:
     if digest != manifest["adapter_queries_sha256"]:
         raise ValueError("Adapter query artifact does not match the protocol")
     queries = [json.loads(line) for line in query_path.read_text().splitlines()]
+    candidate_items = set(candidate_item_ids)
+    required_capture = min(
+        len(candidate_item_ids),
+        max(len(set(row["seen"]) & candidate_items) for row in queries) + 200,
+    )
+    if args.capture_top_k < required_capture:
+        parser.error(
+            f"--capture-top-k must be at least {required_capture} for complete seen-item filtering"
+        )
     match_window = evaluation_history_length or model_history_length
     fingerprints = {
         (tuple(row["history"][-match_window:]), int(row["target"])): str(row["query_id"])
@@ -278,13 +321,15 @@ def main() -> None:
     full_seen = {str(row["query_id"]): set(row["seen"]) for row in queries}
     predictions: dict[str, list[int]] = {}
     model_statistics: dict[str, int] = {}
-    inference_memory_reset = False
+    evaluation_profiles: list[dict[str, float | int]] = []
+    trained_model: Any | None = None
     original_eval = trainer.eval_metrics_v2_from_tensors
     original_model_factory = trainer.get_sequential_encoder
     original_data_loader = trainer.create_data_loader
     data_loader_calls = 0
 
     def capturing_model_factory(*positional: Any, **keyword: Any) -> Any:
+        nonlocal trained_model
         model = original_model_factory(*positional, **keyword)
         if checkpoint is not None:
             payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
@@ -297,19 +342,17 @@ def main() -> None:
         model_statistics["trainable_parameters"] = sum(
             parameter.numel() for parameter in model.parameters() if parameter.requires_grad
         )
+        trained_model = model
         return model
 
     def capturing_eval(*positional: Any, **keyword: Any) -> Any:
-        nonlocal inference_memory_reset
-        if not inference_memory_reset:
-            torch.cuda.reset_peak_memory_stats()
-            inference_memory_reset = True
         eval_state = positional[0]
         seq_features = positional[2]
         target_ids = keyword.get("target_ids", positional[3] if len(positional) > 3 else None)
         if target_ids is None:
             raise RuntimeError("Upstream evaluator did not provide target IDs")
         captured: list[torch.Tensor] = []
+        capture_rankings = True
         original_top_k = eval_state.candidate_index.get_top_k_outputs
         model = positional[1]
         original_encode = model.encode
@@ -317,6 +360,9 @@ def main() -> None:
         def encode_with_short_history(*encode_positional: Any, **encode_keyword: Any) -> Any:
             window = args.evaluation_history_length or args.train_history_length
             if window is None:
+                encode_keyword["past_payloads"] = _causal_payloads(
+                    torch, encode_keyword["past_lengths"], encode_keyword["past_payloads"]
+                )
                 return original_encode(*encode_positional, **encode_keyword)
             raw_ids = encode_keyword["past_ids"]
             source_shape = raw_ids.shape[:2]
@@ -361,24 +407,33 @@ def main() -> None:
                 past_lengths=short_lengths,
                 past_ids=short_ids,
                 past_embeddings=model.get_item_embeddings(short_ids),
-                past_payloads=short_payloads,
+                past_payloads=_causal_payloads(torch, short_lengths, short_payloads),
             )
             return original_encode(*encode_positional, **encode_keyword)
 
         def capture_top_k(*top_positional: Any, **top_keyword: Any) -> Any:
-            # Keep the upstream evaluator's full candidate index and requested
-            # k so its own metrics remain unchanged. We only retain a prefix of
-            # the returned global ranking for the authoritative full-history
-            # filter below; 400 candidates are sufficient after removing at most
-            # the protocol's 200-item history.
             result = original_top_k(*top_positional, **top_keyword)
-            captured.append(result[0][:, : args.capture_top_k].detach().cpu())
+            if capture_rankings:
+                captured.append(result[0][:, : args.capture_top_k].detach().cpu())
             return result
 
         eval_state.candidate_index.get_top_k_outputs = capture_top_k
         model.encode = encode_with_short_history
+        torch.cuda.synchronize()
+        keyword["filter_invalid_ids"] = False
         try:
-            result = original_eval(*positional, **keyword)
+            if checkpoint is not None:
+                result = original_eval(*positional, **keyword)
+                capture_rankings = False
+                torch.cuda.synchronize()
+                torch.cuda.reset_peak_memory_stats()
+                evaluation_started = time.perf_counter()
+                for _ in range(args.profile_repetitions):
+                    result = original_eval(*positional, **keyword)
+            else:
+                torch.cuda.reset_peak_memory_stats()
+                evaluation_started = time.perf_counter()
+                result = original_eval(*positional, **keyword)
         finally:
             model.encode = original_encode
             eval_state.candidate_index.get_top_k_outputs = original_top_k
@@ -387,20 +442,33 @@ def main() -> None:
         targets = target_ids.detach().cpu().reshape(-1)
         if len(ranked) != len(histories):
             raise RuntimeError("Captured rankings and upstream batch are misaligned")
+        matched_queries = 0
         for history, target, ranking in zip(histories, targets, ranked, strict=True):
             key = (tuple(int(item) for item in history if item)[-match_window:], int(target))
             query_id = fingerprints.get(key)
             if query_id is not None:
+                matched_queries += 1
                 filtered = [
                     int(item)
                     for item in ranking.tolist()
-                    if int(item) not in full_seen[query_id]
+                    if int(item) in candidate_items and int(item) not in full_seen[query_id]
                 ]
                 if len(filtered) < 200:
                     raise RuntimeError(
                         f"Captured ranking for {query_id} has fewer than 200 full-catalog items"
                     )
                 predictions[query_id] = filtered[:200]
+        torch.cuda.synchronize()
+        evaluation_seconds = time.perf_counter() - evaluation_started
+        evaluation_profiles.append(
+            {
+                "queries": matched_queries * args.profile_repetitions,
+                "seconds": evaluation_seconds,
+                "qps": matched_queries * args.profile_repetitions / evaluation_seconds,
+                "peak_gpu_memory_bytes": torch.cuda.max_memory_allocated(),
+                "peak_gpu_reserved_bytes": torch.cuda.max_memory_reserved(),
+            }
+        )
         return result
 
     def checkpoint_data_loader(*positional: Any, **keyword: Any) -> Any:
@@ -428,10 +496,9 @@ def main() -> None:
         if args.epochs < 1:
             raise ValueError("Epoch override must be positive")
         gin.bind_parameter("train_fn.num_epochs", args.epochs)
-    if args.model_history_length is not None and checkpoint is None:
-        # Cold-adapted runs only need a validation signal at the beginning and the
-        # final epoch. Keeping one partial batch between them preserves training
-        # while avoiding repeated full-catalog scans.
+    if checkpoint is None:
+        # Evaluation does not affect optimization. Capture the initial and final
+        # full rankings, with one diagnostic batch between them.
         effective_epochs = int(gin.query_parameter("train_fn.num_epochs"))
         gin.bind_parameter("train_fn.partial_eval_num_iters", 1)
         if effective_epochs > 1:
@@ -450,6 +517,12 @@ def main() -> None:
         if temporary_training_file is not None:
             temporary_training_file.unlink(missing_ok=True)
     elapsed = time.perf_counter() - started
+    if trained_model is None:
+        raise RuntimeError("Upstream trainer did not construct a model")
+    checkpoint_output: Path | None = None
+    if checkpoint is None:
+        checkpoint_output = output.with_suffix(".pt")
+        torch.save({"model_state_dict": trained_model.state_dict()}, checkpoint_output)
 
     missing = sorted({row["query_id"] for row in queries} - predictions.keys())
     if missing:
@@ -464,6 +537,8 @@ def main() -> None:
         resolved_partial_eval_iters = int(gin.query_parameter("train_fn.partial_eval_num_iters"))
     except ValueError:
         resolved_partial_eval_iters = None
+    profiled_queries = sum(int(profile["queries"]) for profile in evaluation_profiles)
+    profiled_seconds = sum(float(profile["seconds"]) for profile in evaluation_profiles)
     with output.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(
             handle,
@@ -502,6 +577,14 @@ def main() -> None:
                     if checkpoint is not None
                     else None
                 ),
+                "exported_checkpoint": (
+                    {
+                        "path": checkpoint_output.name,
+                        "sha256": hashlib.sha256(checkpoint_output.read_bytes()).hexdigest(),
+                    }
+                    if checkpoint_output is not None
+                    else None
+                ),
                 "evaluation_history_length": evaluation_history_length,
                 "training_history_length": args.train_history_length,
                 "model_history_length": model_history_length,
@@ -510,12 +593,39 @@ def main() -> None:
                 "capture_top_k": args.capture_top_k,
                 "eval_batch_size": resolved_eval_batch_size,
                 "inference_precision": "bfloat16" if args.bf16 else "float32",
+                "profile_warmup_passes": 1 if checkpoint is not None else 0,
+                "profile_repetitions": args.profile_repetitions,
                 "memory_measurement": "inference-only",
                 "seen_item_filter": "full protocol history",
+                "candidate_index": "shared protocol candidate catalog",
+                "held_out_timestamp_feature": "replaced with last observed timestamp",
                 "torch": torch.__version__,
                 "cuda": torch.version.cuda,
                 "gpu": torch.cuda.get_device_name(0),
                 "peak_gpu_memory_bytes": torch.cuda.max_memory_allocated(),
+                "representative_evaluation_batch": (
+                    max(evaluation_profiles, key=lambda profile: profile["queries"])
+                    if evaluation_profiles
+                    else None
+                ),
+                "profiled_evaluation": (
+                    {
+                        "queries": profiled_queries,
+                        "passes": profiled_queries / manifest["query_count"],
+                        "seconds": profiled_seconds,
+                        "qps": profiled_queries / profiled_seconds,
+                        "peak_gpu_memory_bytes": max(
+                            int(profile["peak_gpu_memory_bytes"])
+                            for profile in evaluation_profiles
+                        ),
+                        "peak_gpu_reserved_bytes": max(
+                            int(profile["peak_gpu_reserved_bytes"])
+                            for profile in evaluation_profiles
+                        ),
+                    }
+                    if evaluation_profiles
+                    else None
+                ),
                 **model_statistics,
                 "elapsed_seconds": elapsed,
                 "prediction_sha256": hashlib.sha256(output.read_bytes()).hexdigest(),

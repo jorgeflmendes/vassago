@@ -6,6 +6,9 @@ build-backend = "hatchling.build"
 name = "vassago-rank"
 version = "0.1.0"
 description = "VASSAGO temporal candidate-conditioned evidence ranker for sequential recommendation"
+authors = [
+    { name = "Jorge Mendes" },
+]
 requires-python = ">=3.11,<3.14"
 license = { file = "LICENSE" }
 dependencies = ["torch>=2.6,<3", "numpy>=2,<3", "polars>=1.30,<2", "pyarrow>=19,<24", "pydantic>=2.10,<3", "pyyaml>=6,<7", "safetensors>=0.5,<1"]

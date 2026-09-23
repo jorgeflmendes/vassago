@@ -28,6 +28,7 @@ from vassago.training import seed_everything, train_sid
 
 
 def _sequences(path: Path) -> list[dict[str, Any]]:
+    csv.field_size_limit(2**31 - 1)
     with path.open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
     return [
@@ -147,12 +148,15 @@ def _event_queries(
         if len(row["items"]) < abs(target_index):
             continue
         history = row["items"][:target_index][-max_length:]
+        history_timestamps = row["timestamps"][:target_index][-max_length:]
+        if not history_timestamps:
+            continue
         examples.append(
             Example(
                 user_id=row["user_id"],
                 history=history,
                 target=row["items"][target_index],
-                timestamp=row["timestamps"][target_index],
+                timestamp=history_timestamps[-1],
                 rating=row["ratings"][target_index],
                 partition=partition,
                 seen=sorted(set(history)),
@@ -240,11 +244,19 @@ def run_fair_vassago(
         raise ValueError("VASSAGO data does not match the protocol")
     if sha256(data / "catalog.json") != protocol.catalog_sha256:
         raise ValueError("VASSAGO catalog does not match the protocol")
-    if sha256(protocol_directory / "hstu_sequences.csv") != protocol.sequence_sha256:
+    sequence_path = protocol_directory / "hstu_sequences.csv"
+    if sha256(sequence_path) != protocol.sequence_sha256:
         raise ValueError("Protocol sequence artifact has changed")
     seed_everything(config.seed)
     started = time.perf_counter()
-    rows = _sequences(protocol_directory / "hstu_sequences.csv")
+    rows = _sequences(sequence_path)
+    training_sequence_path = protocol_directory / "hstu_training_sequences.csv"
+    if protocol.training_sequence_sha256 is None:
+        training_rows = rows
+    else:
+        if sha256(training_sequence_path) != protocol.training_sequence_sha256:
+            raise ValueError("Protocol training sequence artifact has changed")
+        training_rows = _sequences(training_sequence_path)
     movies = [
         Movie.model_validate({**row, "available_at": 0, "metadata_available_at": 0})
         for row in json.loads((data / "catalog.json").read_text(encoding="utf-8"))
@@ -299,10 +311,10 @@ def run_fair_vassago(
             F.cross_entropy(logits, torch.tensor([target], device=config.device)).backward()
             gate_optimizer.step()
 
-    counts = _counts(rows, len(movies))
+    counts = _counts(training_rows, len(movies))
     seed_everything(config.seed)
     model = VassagoRanker(config, movies, embeddings, counts)
-    training["final"] = _fit_experts(model, rows, counts, config, config.seed)
+    training["final"] = _fit_experts(model, training_rows, counts, config, config.seed)
     model.calibrator = type(model.calibrator).from_state(shadow.calibrator.state())
     model.gate.load_state_dict(shadow.gate.state_dict())
     training["stacking_examples"] = {

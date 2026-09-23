@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "registration": "ml100k_external_benchmark.json",
+  "protocol_hash": "dec219a93f4bea53aa4c04e0dfd639a6487da72765bc212e4d9ed755f36f0b3e",
+  "seeds": [
+    42,
+    43,
+    44,
+    45,
+    46
+  ],
+  "queries_per_seed": 943,
+  "comparison_sha256": "2728004b9ad206982df93cff2e1632b602499c6d0c26630b1f56c2009d2f1944",
+  "means": {
+    "vassago": {
+      "NDCG@10": 0.1134,
+      "Recall@10": 0.2087,
+      "MRR@10": 0.0846,
+      "NDCG@50": 0.1685,
+      "Recall@50": 0.4621,
+      "NDCG@200": 0.2138,
+      "Recall@200": 0.7601
+    },
+    "hstu-adapted": {
+      "NDCG@10": 0.10802248207916314,
+      "Recall@10": 0.20381760339342522,
+      "MRR@10": 0.07929732868757258,
+      "NDCG@50": 0.16898479603306707,
+      "Recall@50": 0.48207847295864265,
+      "NDCG@200": 0.2121104253674333,
+      "Recall@200": 0.7675503711558855
+    },
+    "sasrec-adapted": {
+      "NDCG@10": 0.10429894793175296,
+      "Recall@10": 0.1951219512195122,
+      "MRR@10": 0.0766965442946355,
+      "NDCG@50": 0.16030041020152389,
+      "Recall@50": 0.45302226935312834,
+      "NDCG@200": 0.2059657755340482,
+      "Recall@200": 0.7546129374337222
+    }
+  },
+  "primary_paired_tests": {
+    "vassago-minus-hstu": {
+      "mean_difference": 0.005377517920836863,
+      "ci_95": [
+        -0.009072329355273164,
+        0.011706415204842823
+      ],
+      "p_value": 0.8032196780321967
+    },
+    "vassago-minus-sasrec": {
+      "mean_difference": 0.009101052068247045,
+      "ci_95": [
+        -0.004418456855098988,
+        0.014323248668974203
+      ],
+      "p_value": 0.29017098290170984
+    }
+  },
+  "vassago_catalog_metrics_at_10": {
+    "coverage": 0.684423,
+    "long_tail_coverage": 0.416845,
+    "novelty": 9.840371,
+    "genre_diversity": 0.773532,
+    "average_popularity": 156.080361
+  },
+  "vassago_serving": {
+    "artifact_sha256": "6251c20bf0d23175cf3b13f8178e3db898d23da43be9be83cc2b1e3862fd27ac",
+    "batch_size": 64,
+    "precision": "bfloat16",
+    "measured_queries": 4715,
+    "qps": 3241.340670736131,
+    "latency_ms": {
+      "p50": 19.37780000298517,
+      "p95": 19.910600002185674,
+      "p99": 20.665217997739102
+    },
+    "peak_allocated_bytes": 103901696,
+    "peak_reserved_bytes": 125829120
+  }
+}

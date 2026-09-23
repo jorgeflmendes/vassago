@@ -13,6 +13,7 @@ from typing import Any
 import numpy as np
 import polars as pl
 import torch
+from pydantic import BaseModel, ConfigDict, Field
 from safetensors.torch import save_file
 from torch import Tensor, nn
 from torch.nn import functional as F
@@ -31,6 +32,77 @@ from vassago.models import SASRec
 from vassago.training import seed_everything
 
 
+class FixedSelectionRecipe(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: int = Field(ge=1)
+    source_protocol_hash: str = Field(min_length=64, max_length=64)
+    selected_base_epoch: int = Field(ge=1)
+    selected_context_epoch: int = Field(ge=1)
+    selected_joint_epoch: int = Field(ge=0)
+    selected_evidence_scale: float = Field(gt=0)
+    selected_original_weight: float = Field(ge=0, le=1)
+    config_fingerprint: str | None = Field(default=None, min_length=64, max_length=64)
+
+
+def _config_fingerprint(config: ExperimentConfig) -> str:
+    payload = json.dumps(
+        config.model_dump(exclude={"seed"}), sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _read_selection_recipe(
+    path: Path, target_protocol_hash: str, config: ExperimentConfig
+) -> FixedSelectionRecipe:
+    recipe = FixedSelectionRecipe.model_validate_json(path.read_text(encoding="utf-8"))
+    if recipe.source_protocol_hash == target_protocol_hash:
+        raise ValueError("Selection recipe must originate from a separate development protocol")
+    if (
+        recipe.config_fingerprint is not None
+        and recipe.config_fingerprint != _config_fingerprint(config)
+    ):
+        raise ValueError("Selection recipe does not match the configured architecture")
+    return recipe
+
+
+def freeze_selection_recipe(
+    selection_manifest: Path, config: ExperimentConfig, output: Path
+) -> Path:
+    if output.exists():
+        raise FileExistsError(output)
+    selection = json.loads(selection_manifest.read_text(encoding="utf-8"))
+    required = {
+        "protocol_hash",
+        "selected_base_epoch",
+        "selected_context_epoch",
+        "selected_joint_epoch",
+        "selected_evidence_scale",
+        "selected_original_weight",
+    }
+    if selection.get("status") != "completed" or selection.get("test_evaluated") is not False:
+        raise ValueError("Selection manifest must be a completed test-blind validation run")
+    if required - selection.keys():
+        raise ValueError("Selection manifest is missing frozen-recipe fields")
+    manifest_config = json.dumps(selection.get("config"), sort_keys=True, separators=(",", ":"))
+    configured = json.dumps(config.model_dump(), sort_keys=True, separators=(",", ":"))
+    if manifest_config != configured:
+        raise ValueError("Selection manifest does not match the configured architecture")
+    recipe = FixedSelectionRecipe(
+        schema_version=1,
+        source_protocol_hash=selection["protocol_hash"],
+        selected_base_epoch=selection["selected_base_epoch"],
+        selected_context_epoch=selection["selected_context_epoch"],
+        selected_joint_epoch=selection["selected_joint_epoch"],
+        selected_evidence_scale=selection["selected_evidence_scale"],
+        selected_original_weight=selection["selected_original_weight"],
+        config_fingerprint=_config_fingerprint(config),
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(recipe.model_dump(), indent=2) + "\n", encoding="utf-8")
+    return output
+
+
 def _sequence_tensors_with_timestamps(
     rows: list[dict[str, Any]], max_length: int, device: str
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
@@ -40,10 +112,9 @@ def _sequence_tensors_with_timestamps(
     for index, row in enumerate(rows):
         training = row["timestamps"][:-1][-max_length - 1 :]
         inputs = training[:-1]
-        outputs = training[1:]
         if inputs:
             timestamps[index, : len(inputs)] = torch.tensor(inputs, device=device)
-            query_timestamps[index, : len(outputs)] = torch.tensor(outputs, device=device)
+            query_timestamps[index, : len(inputs)] = torch.tensor(inputs, device=device)
     return history, targets, timestamps, query_timestamps
 
 
@@ -58,12 +129,11 @@ def _timestamp_tensor(
 
 
 def _query_timestamp_tensor(
-    history_timestamps: Tensor, lengths: Tensor, target_timestamps: Tensor
+    history_timestamps: Tensor, lengths: Tensor, query_timestamps: Tensor
 ) -> Tensor:
-    result = torch.zeros_like(history_timestamps)
-    result[:, :-1] = history_timestamps[:, 1:]
+    result = history_timestamps.clone()
     rows = torch.arange(len(result), device=result.device)
-    result[rows, (lengths - 1).clamp_min(0)] = target_timestamps
+    result[rows, (lengths - 1).clamp_min(0)] = query_timestamps
     return result
 
 
@@ -235,9 +305,14 @@ class ContextualEvidenceRanker(nn.Module):
         memory_window: int,
         temperature: float,
         contextual_heads: int = 1,
+        persistence_scales: int = 0,
+        velocity_scales: int = 0,
+        ffn_dim: int | None = None,
     ) -> None:
         super().__init__()
-        self.backbone = ContextualBackbone(n_items, dimension, max_length, heads, layers, dropout)
+        self.backbone = ContextualBackbone(
+            n_items, dimension, max_length, heads, layers, dropout, ffn_dim=ffn_dim
+        )
         self.memory_window = memory_window
         self.temperature = temperature
         self.key_projections = nn.ModuleList(
@@ -250,8 +325,34 @@ class ContextualEvidenceRanker(nn.Module):
             nn.Linear(dimension, 1, bias=False) for _ in range(contextual_heads)
         )
         self.decay_unconstrained = nn.Parameter(torch.zeros(contextual_heads))
-        # A small initial correction makes the new model start close to its control.
         self.gamma_unconstrained = nn.Parameter(torch.full((contextual_heads,), -3.0))
+        self.persistence_scales = persistence_scales
+        if persistence_scales:
+            self.persistence_router = nn.Linear(dimension, persistence_scales, bias=False)
+            self.persistence_candidate_gate = nn.Linear(dimension, persistence_scales, bias=False)
+            self.persistence_history_gate = nn.Linear(dimension, 1)
+            start = torch.linspace(
+                float(np.log(6 * 60 * 60)), float(np.log(90 * 24 * 60 * 60)), persistence_scales
+            )
+            increments = start - float(np.log(60 * 60))
+            increments[1:] = start[1:] - start[:-1]
+            self.persistence_half_life_increments = nn.Parameter(
+                torch.log(torch.expm1(increments))
+            )
+            self.persistence_gamma_unconstrained = nn.Parameter(torch.tensor(-4.0))
+            self.persistence_disagreement_unconstrained = nn.Parameter(torch.tensor(-2.0))
+        self.velocity_scales = velocity_scales
+        if velocity_scales:
+            self.velocity_router = nn.Linear(dimension, velocity_scales, bias=False)
+            self.velocity_candidate_gate = nn.Linear(dimension, velocity_scales, bias=False)
+            self.velocity_history_gate = nn.Linear(dimension, 1)
+            start = torch.linspace(
+                float(np.log(30 * 60)), float(np.log(30 * 24 * 60 * 60)), velocity_scales
+            )
+            increments = start - float(np.log(5 * 60))
+            increments[1:] = start[1:] - start[:-1]
+            self.velocity_half_life_increments = nn.Parameter(torch.log(torch.expm1(increments)))
+            self.velocity_gamma_unconstrained = nn.Parameter(torch.tensor(-4.0))
 
     @property
     def gamma(self) -> Tensor:
@@ -270,7 +371,13 @@ class ContextualEvidenceRanker(nn.Module):
         mask &= valid[batch, indices]
         return memory, mask, offsets.expand(len(states), -1)
 
-    def _head_evidence(self, memory: Tensor, mask: Tensor, candidates: Tensor, head: int) -> Tensor:
+    def _head_evidence(
+        self,
+        memory: Tensor,
+        mask: Tensor,
+        candidates: Tensor,
+        head: int,
+    ) -> Tensor:
         keys = F.normalize(self.key_projections[head](memory), dim=-1)
         item_vectors = self.backbone.item_vectors()[candidates]
         queries = F.normalize(self.query_projections[head](item_vectors), dim=-1)
@@ -283,14 +390,19 @@ class ContextualEvidenceRanker(nn.Module):
         log_weights = F.log_softmax(salience, dim=-1)
         weights = log_weights.exp()
         similarities = torch.einsum("ncr,nwr->ncw", queries, keys)
-        aggregate = self.temperature * torch.logsumexp(
+        contextual = self.temperature * torch.logsumexp(
             log_weights[:, None, :] + similarities / self.temperature, dim=-1
         )
         mean_key = torch.einsum("nw,nwr->nr", weights, keys)
         linear = torch.einsum("ncr,nr->nc", queries, mean_key)
-        return aggregate - linear
+        return contextual - linear
 
-    def _evidence(self, memory: Tensor, mask: Tensor, candidates: Tensor) -> Tensor:
+    def _evidence(
+        self,
+        memory: Tensor,
+        mask: Tensor,
+        candidates: Tensor,
+    ) -> Tensor:
         components = torch.stack(
             [
                 self._head_evidence(memory, mask, candidates, head)
@@ -299,6 +411,123 @@ class ContextualEvidenceRanker(nn.Module):
             dim=-1,
         )
         return (components * self.gamma).sum(-1)
+
+    def _persistence_tracks(
+        self,
+        states: Tensor,
+        valid: Tensor,
+        positions: Tensor,
+        timestamps: Tensor | None,
+    ) -> tuple[Tensor, Tensor] | None:
+        if not self.persistence_scales:
+            return None
+        memory, mask, offsets = self._memory(states, valid, positions)
+        log_half_lives = float(np.log(60 * 60)) + torch.cumsum(
+            F.softplus(self.persistence_half_life_increments), dim=0
+        )
+        half_lives = log_half_lives.exp().to(dtype=states.dtype)
+        if timestamps is None:
+            ages = (self.memory_window - 1 - offsets).to(dtype=states.dtype)
+        else:
+            indices = positions[:, None] - (self.memory_window - 1 - offsets)
+            indices = indices.clamp_min(0)
+            batch = torch.arange(len(states), device=states.device)[:, None]
+            memory_times = timestamps[batch, indices]
+            query_times = timestamps[
+                torch.arange(len(states), device=states.device), positions
+            ][:, None]
+            ages = (query_times - memory_times).clamp_min(0).to(dtype=states.dtype)
+        decay = torch.exp(-ages[:, :, None] / half_lives[None, None, :])
+        weights = F.softmax(self.persistence_router(memory), dim=-1) * decay
+        weights = weights * mask[:, :, None]
+        numerator = torch.einsum("nwk,nwd->nkd", weights, memory)
+        mass = weights.sum(dim=1)
+        normalized = numerator / mass.clamp_min(torch.finfo(states.dtype).tiny)[:, :, None]
+        tracks = F.normalize(normalized, dim=-1)
+        return tracks, mass
+
+    def _persistence_evidence(
+        self, tracks: tuple[Tensor, Tensor] | None, candidates: Tensor
+    ) -> Tensor:
+        if tracks is None:
+            return self.backbone.item_vectors()[candidates].new_zeros(candidates.shape)
+        states, mass = tracks
+        item_vectors = self.backbone.item_vectors()[candidates]
+        similarities = torch.einsum("ncd,nkd->nck", item_vectors, states)
+        candidate_gate = self.persistence_candidate_gate(item_vectors)
+        history_gate = self.persistence_history_gate(states).squeeze(-1)
+        available = mass.gt(torch.finfo(mass.dtype).tiny)[:, None, :]
+        gate_logits = (candidate_gate + history_gate[:, None, :]).masked_fill(
+            ~available, -torch.inf
+        )
+        gates = F.softmax(gate_logits, dim=-1)
+        signal = (gates * similarities).sum(-1)
+        disagreement = similarities.var(dim=-1, unbiased=False)
+        confidence = torch.exp(
+            -F.softplus(self.persistence_disagreement_unconstrained) * disagreement
+        )
+        return F.softplus(self.persistence_gamma_unconstrained) * confidence * signal
+
+    def _velocity_tracks(
+        self,
+        states: Tensor,
+        valid: Tensor,
+        positions: Tensor,
+        timestamps: Tensor | None,
+        query_timestamps: Tensor | None,
+    ) -> tuple[Tensor, Tensor, Tensor] | None:
+        if not self.velocity_scales:
+            return None
+        memory, mask, offsets = self._memory(states, valid, positions)
+        transitions = memory[:, 1:] - memory[:, :-1]
+        transition_mask = mask[:, 1:] & mask[:, :-1]
+        log_half_lives = float(np.log(5 * 60)) + torch.cumsum(
+            F.softplus(self.velocity_half_life_increments), dim=0
+        )
+        half_lives = log_half_lives.exp().to(dtype=states.dtype)
+        if timestamps is None:
+            ages = (self.memory_window - 1 - offsets[:, 1:]).to(dtype=states.dtype)
+        else:
+            indices = positions[:, None] - (self.memory_window - 1 - offsets[:, 1:])
+            indices = indices.clamp_min(0)
+            batch = torch.arange(len(states), device=states.device)[:, None]
+            end_times = timestamps[batch, indices]
+            if query_timestamps is None:
+                query_times = timestamps[
+                    torch.arange(len(states), device=states.device), positions
+                ][:, None]
+            else:
+                query_times = query_timestamps[
+                    torch.arange(len(states), device=states.device), positions
+                ][:, None]
+            ages = (query_times - end_times).clamp_min(0).to(dtype=states.dtype)
+        decay = torch.exp(-ages[:, :, None] / half_lives[None, None, :])
+        weights = F.softmax(self.velocity_router(memory[:, 1:]), dim=-1) * decay
+        weights = weights * transition_mask[:, :, None]
+        numerator = torch.einsum("nmk,nmd->nkd", weights, transitions)
+        mass = weights.sum(dim=1)
+        momentum = numerator / mass.clamp_min(torch.finfo(states.dtype).tiny)[:, :, None]
+        energy = momentum.norm(dim=-1)
+        return F.normalize(momentum, dim=-1), mass, energy
+
+    def _velocity_evidence(
+        self, tracks: tuple[Tensor, Tensor, Tensor] | None, candidates: Tensor
+    ) -> Tensor:
+        if tracks is None:
+            return self.backbone.item_vectors()[candidates].new_zeros(candidates.shape)
+        momentum, mass, energy = tracks
+        item_vectors = self.backbone.item_vectors()[candidates]
+        similarities = torch.einsum("ncd,nkd->nck", item_vectors, momentum)
+        candidate_gate = self.velocity_candidate_gate(item_vectors)
+        history_gate = self.velocity_history_gate(momentum).squeeze(-1)
+        available = mass.gt(torch.finfo(mass.dtype).tiny)[:, None, :]
+        gate_logits = (candidate_gate + history_gate[:, None, :]).masked_fill(
+            ~available, -torch.inf
+        )
+        gates = F.softmax(gate_logits, dim=-1)
+        gates = torch.where(available.any(-1, keepdim=True), gates, torch.zeros_like(gates))
+        signal = (gates * similarities * energy[:, None, :]).sum(dim=-1)
+        return F.softplus(self.velocity_gamma_unconstrained) * signal
 
     def sampled_logits(
         self,
@@ -322,7 +551,20 @@ class ContextualEvidenceRanker(nn.Module):
         item_vectors = self.backbone.item_vectors()[candidates]
         base = torch.einsum("nd,ncd->nc", context, item_vectors)
         memory, memory_mask, _ = self._memory(selected_states, selected_valid, positions)
+        track_timestamps = None if timestamps is None else timestamps[sequence_rows]
+        tracks = self._persistence_tracks(
+            selected_states, selected_valid, positions, track_timestamps
+        )
+        velocity_tracks = self._velocity_tracks(
+            selected_states,
+            selected_valid,
+            positions,
+            track_timestamps,
+            None if query_timestamps is None else query_timestamps[sequence_rows],
+        )
         contextual = base + self._evidence(memory, memory_mask, candidates)
+        contextual = contextual + self._persistence_evidence(tracks, candidates)
+        contextual = contextual + self._velocity_evidence(velocity_tracks, candidates)
         return base / 0.05, contextual / 0.05
 
     @torch.no_grad()
@@ -345,13 +587,22 @@ class ContextualEvidenceRanker(nn.Module):
         all_items = self.backbone.item_vectors()
         base = context @ all_items.T
         memory, memory_mask, _ = self._memory(states, valid, positions)
+        tracks = self._persistence_tracks(states, valid, positions, timestamps)
+        velocity_tracks = self._velocity_tracks(
+            states, valid, positions, timestamps, query_timestamps
+        )
         output = []
         for start in range(0, len(all_items), chunk_size):
             candidates = torch.arange(
                 start, min(start + chunk_size, len(all_items)), device=history.device
             ).expand(len(history), -1)
-            output.append(self._evidence(memory, memory_mask, candidates))
-        evidence = torch.cat(output, dim=-1) * lengths.gt(0).unsqueeze(-1)
+            output.append(
+                self._evidence(memory, memory_mask, candidates)
+                + self._persistence_evidence(tracks, candidates)
+                + self._velocity_evidence(velocity_tracks, candidates)
+            )
+        evidence = torch.cat(output, dim=-1)
+        evidence = torch.where(lengths.gt(0)[:, None], evidence, torch.zeros_like(evidence))
         return base, base + evidence
 
     def evidence_bounds(
@@ -367,12 +618,14 @@ class ContextualEvidenceRanker(nn.Module):
             raise ValueError("groups must be within [1, memory_window]")
         if len(self.key_projections) != 1:
             raise ValueError("evidence bounds currently require one contextual head")
+        if self.persistence_scales:
+            raise ValueError("evidence bounds require persistence scales disabled")
         valid = history.ne(0)
         lengths = valid.sum(-1)
         positions = (lengths - 1).clamp_min(0)
         states = self.backbone.sequence_states(history, timestamps, query_timestamps)
         memory, mask, _ = self._memory(states, valid, positions)
-        exact = self._head_evidence(memory, mask, candidates, 0)
+        exact = self._head_evidence(memory, mask, candidates, 0) * self.gamma[0]
         keys = F.normalize(self.key_projections[0](memory), dim=-1)
         queries = F.normalize(
             self.query_projections[0](self.backbone.item_vectors()[candidates]), dim=-1
@@ -400,8 +653,12 @@ class ContextualEvidenceRanker(nn.Module):
             log_mass = safe_mass.log()[:, None]
             lower_terms.append(log_mass + center_score / self.temperature)
             upper_terms.append(log_mass + (center_score + radius[:, None]) / self.temperature)
-        lower = self.temperature * torch.logsumexp(torch.stack(lower_terms), dim=0) - linear
-        upper = self.temperature * torch.logsumexp(torch.stack(upper_terms), dim=0) - linear
+        lower = self.gamma[0] * (
+            self.temperature * torch.logsumexp(torch.stack(lower_terms), dim=0) - linear
+        )
+        upper = self.gamma[0] * (
+            self.temperature * torch.logsumexp(torch.stack(upper_terms), dim=0) - linear
+        )
         return exact, lower, upper
 
 
@@ -529,7 +786,7 @@ def _select_evidence_scale(
     timestamp_histories: dict[str, list[int]],
     config: ExperimentConfig,
 ) -> tuple[float, dict[str, dict[str, float]]]:
-    """Select a validation-Pareto scale, prioritising the contested @50 metrics."""
+    """Select the evidence scale by the registered primary validation metric."""
     candidates = (0.5, 0.75, 1.0, 1.25, 1.5, 2.0)
     evaluations = {
         str(scale): _validation_cutoff_metrics(
@@ -537,31 +794,7 @@ def _select_evidence_scale(
         )
         for scale in candidates
     }
-    baseline = evaluations["1.0"]
-    protected = (
-        "Recall@10",
-        "NDCG@10",
-        "MRR@10",
-        "Recall@200",
-        "NDCG@200",
-        "MRR@200",
-    )
-    eligible = [
-        scale
-        for scale in candidates
-        if all(
-            evaluations[str(scale)][metric] >= baseline[metric] - 1e-12
-            for metric in protected
-        )
-    ]
-    selected = max(
-        eligible,
-        key=lambda scale: (
-            evaluations[str(scale)]["Recall@50"],
-            evaluations[str(scale)]["NDCG@50"],
-            evaluations[str(scale)]["MRR@50"],
-        ),
-    )
+    selected = max(candidates, key=lambda scale: evaluations[str(scale)]["NDCG@10"])
     return selected, evaluations
 
 
@@ -773,12 +1006,13 @@ def _fit_base(
     popularity /= popularity.sum().clamp_min(1)
     best_metric, best_epoch, best = -1.0, epochs, None
     training_log: list[dict[str, float]] = []
+    batch_size = config.base_batch_size or config.batch_size
     for epoch in range(epochs):
         model.train()
         losses = []
         order = rng.permutation(len(rows))
-        for start in range(0, len(rows), config.batch_size):
-            batch = [rows[int(index)] for index in order[start : start + config.batch_size]]
+        for start in range(0, len(rows), batch_size):
+            batch = [rows[int(index)] for index in order[start : start + batch_size]]
             history, all_targets, timestamps, query_timestamps = _sequence_tensors_with_timestamps(
                 batch, config.max_length, config.device
             )
@@ -999,17 +1233,25 @@ def run_fair_contextual(
     output: Path,
     *,
     validation_only: bool = False,
+    selection_recipe: Path | None = None,
 ) -> Path:
-    """Select duration temporally, retrain, and export base/contextual rankings."""
+    """Select duration temporally or use a frozen recipe, then export rankings."""
     if output.exists():
         raise FileExistsError(output)
     if validation_only and output.suffix != ".json":
         raise ValueError("Validation-only output must have a .json suffix")
+    if validation_only and selection_recipe is not None:
+        raise ValueError("Validation-only execution cannot use a fixed selection recipe")
     protocol = FairProtocol.model_validate_json(
         (protocol_directory / "protocol.json").read_text(encoding="utf-8")
     )
     if protocol.protocol_hash != protocol.expected_hash():
         raise ValueError("Protocol manifest hash is invalid")
+    recipe = (
+        _read_selection_recipe(selection_recipe, protocol.protocol_hash, config)
+        if selection_recipe is not None
+        else None
+    )
     if config.max_length != protocol.history_length or config.positive_threshold != 0.5:
         raise ValueError("Contextual config must use protocol history and all ratings")
     if sha256(data / "interactions.parquet") != protocol.interactions_sha256:
@@ -1023,7 +1265,17 @@ def run_fair_contextual(
             raise RuntimeError("CUDA was requested but is unavailable")
         torch.cuda.reset_peak_memory_stats()
     started = time.perf_counter()
-    rows = _sequences(protocol_directory / "hstu_sequences.csv")
+    sequence_path = protocol_directory / "hstu_sequences.csv"
+    if sha256(sequence_path) != protocol.sequence_sha256:
+        raise ValueError("Protocol sequence artifact has changed")
+    rows = _sequences(sequence_path)
+    training_sequence_path = protocol_directory / "hstu_training_sequences.csv"
+    if protocol.training_sequence_sha256 is None:
+        final_rows = rows
+    else:
+        if sha256(training_sequence_path) != protocol.training_sequence_sha256:
+            raise ValueError("Protocol training sequence artifact has changed")
+        final_rows = _sequences(training_sequence_path)
 
     def create_model() -> ContextualEvidenceRanker:
         return ContextualEvidenceRanker(
@@ -1037,75 +1289,95 @@ def run_fair_contextual(
             config.contextual_memory_window,
             config.contextual_temperature,
             config.contextual_heads,
+            config.contextual_persistence_scales,
+            config.contextual_velocity_scales,
         ).to(config.device)
 
-    validation_rows = _truncate_rows(rows, 1)
-    validation_examples = _event_queries(rows, -2, config.max_length, "model_selection")
-    validation_timestamps = {
-        row["user_id"]: row["timestamps"][:-2][-config.max_length :] for row in rows
-    }
-    validation_counts = _counts(validation_rows, protocol.item_count)
-    shadow = create_model()
-    base_selection_log, best_base_epoch = _fit_base(
-        shadow,
-        validation_rows,
-        validation_counts,
-        config,
-        config.epochs,
-        validation_examples,
-        validation_timestamps,
-    )
-    context_selection_log, best_context_epoch = _fit_context(
-        shadow,
-        validation_rows,
-        validation_counts,
-        config,
-        config.contextual_epochs,
-        validation_examples,
-        validation_timestamps,
-    )
-    context_best = max(row.get("validation_ndcg10", -1.0) for row in context_selection_log)
+    base_selection_log: list[dict[str, float]] = []
+    context_selection_log: list[dict[str, float]] = []
     joint_selection_log: list[dict[str, float]] = []
-    best_joint_epoch = 0
-    selected_original_weight = 1.0
     weight_soup_validation: dict[str, dict[str, float]] = {}
-    if config.contextual_joint_epochs:
-        before_joint = _cpu_state(shadow)
-        joint_selection_log, best_joint_epoch = _fit_context(
+    evidence_scale_validation: dict[str, dict[str, float]] = {}
+    if recipe is not None:
+        best_base_epoch = recipe.selected_base_epoch
+        best_context_epoch = recipe.selected_context_epoch
+        best_joint_epoch = recipe.selected_joint_epoch
+        selected_evidence_scale = recipe.selected_evidence_scale
+        selected_original_weight = recipe.selected_original_weight
+        if (
+            best_base_epoch > config.epochs
+            or best_context_epoch > config.contextual_epochs
+            or best_joint_epoch > config.contextual_joint_epochs
+        ):
+            raise ValueError("Fixed selection recipe exceeds the configured training budget")
+    else:
+        validation_rows = _truncate_rows(rows, 1)
+        validation_examples = _event_queries(rows, -2, config.max_length, "model_selection")
+        validation_timestamps = {
+            row["user_id"]: row["timestamps"][:-2][-config.max_length :] for row in rows
+        }
+        validation_counts = _counts(validation_rows, protocol.item_count)
+        shadow = create_model()
+        base_selection_log, best_base_epoch = _fit_base(
             shadow,
             validation_rows,
             validation_counts,
             config,
-            config.contextual_joint_epochs,
+            config.epochs,
             validation_examples,
             validation_timestamps,
-            joint=True,
         )
-        joint_best = max(row.get("validation_ndcg10", -1.0) for row in joint_selection_log)
-        if joint_best <= context_best:
-            shadow.load_state_dict(before_joint)
-            best_joint_epoch = 0
-        else:
-            selected_original_weight, weight_soup_validation = _select_weight_soup(
+        context_selection_log, best_context_epoch = _fit_context(
+            shadow,
+            validation_rows,
+            validation_counts,
+            config,
+            config.contextual_epochs,
+            validation_examples,
+            validation_timestamps,
+        )
+        context_best = max(row.get("validation_ndcg10", -1.0) for row in context_selection_log)
+        best_joint_epoch = 0
+        selected_original_weight = 1.0
+        if config.contextual_joint_epochs:
+            before_joint = _cpu_state(shadow)
+            joint_selection_log, best_joint_epoch = _fit_context(
                 shadow,
-                before_joint,
-                _cpu_state(shadow),
+                validation_rows,
+                validation_counts,
+                config,
+                config.contextual_joint_epochs,
                 validation_examples,
                 validation_timestamps,
-                config,
+                joint=True,
             )
-    selected_evidence_scale, evidence_scale_validation = _select_evidence_scale(
-        shadow, validation_examples, validation_timestamps, config
-    )
+            joint_best = max(row.get("validation_ndcg10", -1.0) for row in joint_selection_log)
+            if joint_best <= context_best:
+                shadow.load_state_dict(before_joint)
+                best_joint_epoch = 0
+            else:
+                selected_original_weight, weight_soup_validation = _select_weight_soup(
+                    shadow,
+                    before_joint,
+                    _cpu_state(shadow),
+                    validation_examples,
+                    validation_timestamps,
+                    config,
+                )
+        selected_evidence_scale, evidence_scale_validation = _select_evidence_scale(
+            shadow, validation_examples, validation_timestamps, config
+        )
     if validation_only:
         selected_log = joint_selection_log if best_joint_epoch else context_selection_log
         best = max(selected_log, key=lambda row: row.get("validation_ndcg10", -1.0))
+        _apply_evidence_scale(shadow, selected_evidence_scale)
         output.write_text(
             json.dumps(
                 {
                     "status": "completed",
                     "test_evaluated": False,
                     "split": "temporal_validation",
+                    "selection_metric": "NDCG@10",
                     "protocol_hash": protocol.protocol_hash,
                     "config": config.model_dump(),
                     "selected_base_epoch": best_base_epoch,
@@ -1137,15 +1409,15 @@ def run_fair_contextual(
 
     seed_everything(config.seed)
     model = create_model()
-    counts = _counts(rows, protocol.item_count)
-    final_base_log, _ = _fit_base(model, rows, counts, config, best_base_epoch)
-    final_context_log, _ = _fit_context(model, rows, counts, config, best_context_epoch)
+    counts = _counts(final_rows, protocol.item_count)
+    final_base_log, _ = _fit_base(model, final_rows, counts, config, best_base_epoch)
+    final_context_log, _ = _fit_context(model, final_rows, counts, config, best_context_epoch)
     final_joint_log: list[dict[str, float]] = []
     if best_joint_epoch:
         before_final_joint = _cpu_state(model)
         final_joint_log, _ = _fit_context(
             model,
-            rows,
+            final_rows,
             counts,
             config,
             best_joint_epoch,
@@ -1197,6 +1469,10 @@ def run_fair_contextual(
             allowed = np.ones(protocol.item_count + 1, dtype=bool)
             allowed[0] = False
             allowed[query["seen"]] = False
+            if protocol.candidate_item_ids is not None:
+                allowed[:] = False
+                allowed[protocol.candidate_item_ids] = True
+                allowed[query["seen"]] = False
             eligible = np.flatnonzero(allowed)
             limit = min(200, len(eligible))
             for name, scores in zip(paths, (base, contextual), strict=True):
@@ -1229,7 +1505,11 @@ def run_fair_contextual(
         "protocol_hash": protocol.protocol_hash,
         "config": config.model_dump(),
         "model_selection": {
-            "split": "second-last event; training excludes final two events",
+            "split": (
+                "fixed development recipe"
+                if recipe is not None
+                else "second-last event; training excludes final two events"
+            ),
             "metric": "NDCG@10",
             "selected_base_epoch": best_base_epoch,
             "selected_context_epoch": best_context_epoch,
@@ -1238,6 +1518,16 @@ def run_fair_contextual(
             "evidence_scale_validation": evidence_scale_validation,
             "selected_original_weight": selected_original_weight,
             "weight_soup_validation": weight_soup_validation,
+            "selection_recipe": (
+                {
+                    "path": selection_recipe.name,
+                    "sha256": sha256(selection_recipe),
+                    "source_protocol_hash": recipe.source_protocol_hash,
+                    "config_fingerprint": recipe.config_fingerprint,
+                }
+                if recipe is not None and selection_recipe is not None
+                else None
+            ),
         },
         "training_positions": (
             f"up to {config.contextual_positions_per_user} deterministic positions "

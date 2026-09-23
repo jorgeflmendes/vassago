@@ -58,6 +58,7 @@ def main() -> None:
             "contextual",
             "popularity",
             "evaluate",
+            "freeze-selection",
         ],
     )
     benchmark.add_argument("--config", type=Path)
@@ -66,7 +67,12 @@ def main() -> None:
     benchmark.add_argument("--predictions", type=Path, nargs="+")
     benchmark.add_argument("--output", type=Path, required=True)
     benchmark.add_argument("--history-length", type=int, default=200)
-    benchmark.add_argument("--seed", type=int, default=42)
+    benchmark.add_argument("--global-test-start", type=int)
+    benchmark.add_argument("--query-sample-limit", type=int)
+    benchmark.add_argument("--query-sample-seed", type=int, default=42)
+    benchmark.add_argument("--seed", type=int)
+    benchmark.add_argument("--selection-recipe", type=Path)
+    benchmark.add_argument("--selection-manifest", type=Path)
     benchmark.add_argument("--validation-only", action="store_true")
     args = parser.parse_args()
     if args.command == "benchmark" and args.validation_only and args.action != "contextual":
@@ -134,25 +140,51 @@ def main() -> None:
         if args.action == "prepare":
             if args.data is None:
                 parser.error("benchmark prepare requires --data")
-            print(prepare_protocol(args.data, args.output, args.history_length))
+            print(
+                prepare_protocol(
+                    args.data,
+                    args.output,
+                    args.history_length,
+                    args.global_test_start,
+                    args.query_sample_limit,
+                    args.query_sample_seed,
+                )
+            )
+        elif args.action == "freeze-selection":
+            if args.config is None or args.selection_manifest is None:
+                parser.error(
+                    "benchmark freeze-selection requires --config and --selection-manifest"
+                )
+            from vassago.contextual_ranker import freeze_selection_recipe
+
+            print(
+                freeze_selection_recipe(
+                    args.selection_manifest, ExperimentConfig.read(args.config), args.output
+                )
+            )
         elif args.action == "contextual":
             if args.data is None or args.protocol is None or args.config is None:
                 parser.error("benchmark contextual requires --data, --protocol and --config")
             from vassago.contextual_ranker import run_fair_contextual
 
+            config = ExperimentConfig.read(args.config)
+            if args.seed is not None:
+                config = config.model_copy(update={"seed": args.seed})
             print(
                 run_fair_contextual(
-                    ExperimentConfig.read(args.config),
+                    config,
                     args.data,
                     args.protocol,
                     args.output,
                     validation_only=args.validation_only,
+                    selection_recipe=args.selection_recipe,
                 )
             )
         elif args.action == "popularity":
             if args.data is None or args.protocol is None:
                 parser.error("benchmark popularity requires --data and --protocol")
-            print(popularity_predictions(args.data, args.protocol, args.seed, args.output))
+            seed = 42 if args.seed is None else args.seed
+            print(popularity_predictions(args.data, args.protocol, seed, args.output))
         else:
             if args.protocol is None or args.predictions is None:
                 parser.error("benchmark evaluate requires --protocol and --predictions")

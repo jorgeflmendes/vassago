@@ -18,6 +18,7 @@ class SASRec(nn.Module):
         dropout: float = 0.1,
         semantic: Tensor | None = None,
         finetune: bool = False,
+        ffn_dim: int | None = None,
     ) -> None:
         super().__init__()
         self.max_length = max_length
@@ -28,8 +29,9 @@ class SASRec(nn.Module):
             self.items = nn.Embedding.from_pretrained(semantic, freeze=not finetune, padding_idx=0)
             self.projection = nn.Linear(semantic.shape[1], dimension, bias=False)
         self.positions = nn.Embedding(max_length, dimension)
+        feedforward_dim = ffn_dim if ffn_dim is not None else dimension * 4
         layer = nn.TransformerEncoderLayer(
-            dimension, heads, dimension * 4, dropout, batch_first=True, norm_first=True
+            dimension, heads, feedforward_dim, dropout, batch_first=True, norm_first=True
         )
         self.encoder = nn.TransformerEncoder(layer, layers, enable_nested_tensor=False)
         self.norm = nn.LayerNorm(dimension)

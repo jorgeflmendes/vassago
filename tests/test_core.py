@@ -16,7 +16,12 @@ from vassago.data import (
     synthetic,
     train_statistics,
 )
-from vassago.evaluation import paired_bootstrap, ranking_metrics
+from vassago.evaluation import (
+    deterministic_rank,
+    paired_bootstrap,
+    paired_seed_bootstrap,
+    ranking_metrics,
+)
 from vassago.models import LightGCN, SASRec
 from vassago.retrieval import (
     AdaptiveGate,
@@ -82,6 +87,13 @@ def test_metrics_hand_computed() -> None:
     assert values["MAP@3"] == pytest.approx((0.5 + 2 / 3) / 2)
     assert values["NDCG@3"] == pytest.approx((1 / np.log2(3) + 0.5) / (1 + 1 / np.log2(3)))
     assert ranking_metrics([], {1}, 5)["NDCG@5"] == 0
+
+
+def test_deterministic_rank_breaks_equal_scores_by_item_id() -> None:
+    scores = np.array([0.0, 0.5, 0.5, 0.5])
+    eligible = np.array([False, True, True, True])
+    assert deterministic_rank(scores, 1, eligible) == 1
+    assert deterministic_rank(scores, 3, eligible) == 3
 
 
 def test_exact_crosswalk_and_namespaces() -> None:
@@ -158,10 +170,29 @@ def test_exact_index_and_paired_statistics() -> None:
     result = paired_bootstrap(np.ones(5), np.zeros(5), samples=100)
     assert result["mean_difference"] == result["ci_low"] == result["ci_high"] == 1
 
+    seeded = paired_seed_bootstrap(
+        {42: np.ones(5), 43: np.ones(5)},
+        {42: np.zeros(5), 43: np.zeros(5)},
+        samples=100,
+    )
+    assert seeded["mean_difference"] == seeded["ci_low"] == seeded["ci_high"] == 1
+    with pytest.raises(ValueError, match="same users"):
+        paired_seed_bootstrap(
+            {42: np.ones(5), 43: np.ones(4)},
+            {42: np.zeros(5), 43: np.zeros(4)},
+            samples=100,
+        )
+
 
 def test_config_and_history_contract() -> None:
     with pytest.raises(ValueError):
         ExperimentConfig(dimension=9, heads=2)
+    with pytest.raises(ValueError):
+        ExperimentConfig(contextual_persistence_scales=9)
+    with pytest.raises(ValueError):
+        ExperimentConfig(contextual_velocity_scales=9)
+    with pytest.raises(ValueError):
+        ExperimentConfig(base_batch_size=0)
     assert history_tensor([[1, 2, 3]], 2, "cpu").tolist() == [[2, 3]]
 
 

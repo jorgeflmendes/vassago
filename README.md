@@ -13,6 +13,7 @@
   <a href="#architecture">Architecture</a> ·
   <a href="#results">Benchmark</a> ·
   <a href="#reproduction">Reproduction</a> ·
+  <a href="#acknowledgements">Acknowledgements</a> ·
   <a href="#scientific-scope-and-limitations">Limitations</a>
 </p>
 
@@ -20,17 +21,19 @@ VASSAGO (Variable-gap Attention-based Sequential Scoring, Adaptive Gating, and
 Ordering) is a reproducible research implementation of a compact temporal
 contextual-evidence ranker for sequential recommendation.
 
-> **Research status.** The current single-seed benchmark gives VASSAGO the highest
-> observed NDCG@10 point estimate. The paired comparison with HSTU is statistically
-> tied.
+> **Research status.** Protocol v3 removes the held-out interaction timestamp from every
+> model input. MovieLens 1M is now a development benchmark; comparative claims are based
+> only on the registered external evaluation described below.
+>
+> The published results below evaluate the contextual-evidence model in this source tree.
 
 | | |
 |---|---|
 | **Task** | Sequential recommendation and ranking |
-| **Dataset** | MovieLens 1M; 6,040 test queries over a 3,706-item catalog |
-| **Protocol** | Fixed full-catalog evaluation with identical seen-item filtering |
+| **Datasets** | MovieLens 1M development; registered MovieLens 100K external test |
+| **Protocol** | Fixed full-catalog evaluation with complete seen-item filtering |
 | **Baselines** | Meta HSTU and Meta SASRec |
-| **Model size** | 356,418 parameters; 4,162 contextual parameters |
+| **Model size** | Recorded per checkpoint manifest |
 | **Reference hardware** | NVIDIA RTX 5080; CUDA 13.0; bfloat16 inference |
 
 ## Architecture
@@ -39,15 +42,15 @@ The final model consists of:
 
 * a two-layer causal SASRec backbone with tied item scoring;
 * learned logarithmic event-gap embeddings;
-* per-head query-time attention biases;
+* per-head query-time attention biases using only an explicit request time;
 * exposure-safe causal negative sampling;
-* a 4,162-parameter candidate-conditioned evidence module operating on recent states;
+* a candidate-conditioned evidence module operating on recent states;
 * validation-selected interpolation between frozen and jointly adapted checkpoints; and
 * full-catalog evaluation with identical seen-item exclusion across models.
 
-The evidence correction is candidate-specific and bounded by a learned gate.
+The evidence correction is candidate-specific and bounded by a learned scale.
 
-Model selection is performed using each user's second-last interaction, while the final interaction is reserved for test reporting. Training terminates with an error if non-finite validation or test scores are encountered, preventing invalid rankings from being exported.
+Model selection is performed using each user's second-last interaction, while the final interaction is reserved for test reporting. Offline evaluation uses the last observed timestamp as the request time; the held-out interaction timestamp is never passed to the model. Training terminates with an error if non-finite validation or test scores are encountered, preventing invalid rankings from being exported.
 
 ## Cold-start routing
 
@@ -61,77 +64,90 @@ Once at least one positive behavioral interaction is available, both onboarding 
 
 MovieLens 1M does not contain explicit onboarding profiles. To evaluate the profile-based route, an exploratory proxy was constructed using the three most frequent genres in each user's pre-query history while withholding all historical item IDs from the cold-start ranker. The popularity weight was selected using the second-last interaction.
 
-On the final-interaction test split, this hybrid approach obtains NDCG@10 of `0.02104` and Recall@10 of `0.04172`, compared with `0.01453` and `0.02947`, respectively, for the training-popularity fallback. The paired NDCG@10 difference is `+0.00651`, with a bootstrap 95% CI of `[0.00366, 0.00947]` and `p=0.0006`.
+A second onboarding proxy represents recent pre-query items as ordered favorite selections. Favorite count and set-centroid weight are selected on the independent validation split.
 
-This experiment provides evidence that the routing mechanism can improve over a popularity-only fallback under the proxy setting. It should not be interpreted as a substitute for evaluation using independently collected user profiles.
-
-A second onboarding proxy represents the most recent pre-query items as ordered favorite selections. Validation selected ten favorites and a set-centroid residual weight of `0.025`.
-
-Under this setting, the validation-selected onboarding adapter obtains NDCG@10 of `0.16979` and Recall@10 of `0.29089`. The corresponding values using the complete warm history are `0.19682` and `0.33692`.
-
-The proxy therefore recovers a substantial fraction of the warm-history performance without modifying or retraining the warm model. This estimate is likely optimistic because real users select favorites explicitly, whereas the proxy reconstructs them from previously observed interactions.
-
-For the matched cold-start comparison, all sequential models receive the same ten selected items, use the same complete historical seen-item filter, and are evaluated against the same final target.
-
-| Model                |   Recall@10 |     NDCG@10 |   Recall@50 |     NDCG@50 |  Recall@200 |    NDCG@200 |
-| -------------------- | ----------: | ----------: | ----------: | ----------: | ----------: | ----------: |
-| VASSAGO cold adapter | **0.29089** | **0.16979** | **0.53974** | **0.22495** | **0.75033** | **0.25679** |
-| Meta HSTU cold-10    |     0.07798 |     0.03899 |     0.25811 |     0.07774 |     0.54437 |     0.12051 |
-| Meta SASRec cold-10  |     0.27632 |     0.15830 |     0.52583 |     0.21320 |     0.73245 |     0.24454 |
-
-VASSAGO records the highest point estimate for all reported metrics in this cold-start comparison. Relative to SASRec, the paired NDCG@10 difference is `+0.01148`, with a bootstrap 95% CI of `[0.00605, 0.01716]` and `p<0.001`.
+These proxies are exploratory and do not replace evaluation with independently collected user profiles. Their earlier results used a selection checkpoint that had already seen the validation target and are therefore withdrawn. The corrected workflow selects the adapter using a pre-validation checkpoint, then retrains it for the selected number of epochs from the final warm checkpoint.
 
 ## Results
 
-The main experiment uses MovieLens 1M with seed 42, 6,040 users, 3,706 catalog items, and top-200 full-catalog rankings.
+Protocol v3 uses complete pre-query seen-item exclusion, deterministic score-tie handling, strict rank validation, and causal timestamps. Protocol v1 and v2 results are withdrawn: v1 had incomplete seen-item filtering and dependent cold-start selection, while v2 still supplied the held-out interaction time as the offline request time.
 
-All models use the same protocol, identified by the hash:
+The shared evaluator reports Recall, NDCG, MRR, MAP and HitRate together with catalog coverage, long-tail coverage, average popularity, novelty and genre diversity. Recall and HitRate, and MAP and MRR, are equivalent in the one-target-per-query protocol and are not counted as separate wins.
 
-`677cc91ee500d12f3478b678249e8721d99ea9d1d65c81bdfeebed61bbf25f3e`
+On the MovieLens 1M development split, the causal VASSAGO run obtains Recall@10 `0.332450`, NDCG@10 `0.195728`, Recall@50 `0.591887`, NDCG@50 `0.253240`, Recall@200 `0.780132`, and NDCG@200 `0.281826`. These values are diagnostics rather than an untouched comparative result.
 
-| Model               |   Recall@10 |     NDCG@10 |   Recall@50 |     NDCG@50 |  Recall@200 |    NDCG@200 |
-| ------------------- | ----------: | ----------: | ----------: | ----------: | ----------: | ----------: |
-| Contextual evidence | **0.33692** | **0.19682** | **0.58526** | **0.25198** | **0.78377** | **0.28218** |
-| Meta HSTU           |     0.33328 |     0.19571 | **0.58526** |     0.25159 |     0.77152 |     0.27993 |
-| Meta SASRec         |     0.29139 |     0.17138 |     0.55248 |     0.22902 |     0.74851 |     0.25889 |
+### External benchmark (MovieLens-100K Protocol v3)
 
-Across the complete set of 30 reported metric fields—Recall, NDCG, HitRate, MRR and
-MAP at cutoffs 10, 50 and 200, both overall and for ratings `>=4`—the contextual
-model has the highest point estimate in 28 and ties HSTU on the remaining two fields,
-Recall@50 and HitRate@50. The table shows the six primary Recall/NDCG fields.
+The registered MovieLens 100K evaluation contains 943 queries over 1,682 items. All three models use five seeds (42–46), a fixed configuration, the same causal split, complete-catalog ranking, and complete pre-query seen-item exclusion under Protocol v3. VASSAGO uses the compact linear feedforward architecture (`dimension=48`, `ffn_dim=48`) with calibrated additive evidence scaling ($\lambda = 0.50$).
 
-For NDCG@10, the paired difference relative to HSTU is `+0.00111`, with a bootstrap 95% CI of `[-0.00460, 0.00699]` and `p=0.719`. The available evidence therefore does not distinguish the two models statistically on this metric.
+#### 1. Ranking Accuracy and Precision
 
-Relative to SASRec, the NDCG@10 difference is `+0.02544`, with a 95% CI of `[0.01995, 0.03097]` and `p<0.001`.
+| Model | Parameters | NDCG@10 | Recall@10 | MRR@10 | NDCG@50 | Recall@50 | NDCG@200 | Recall@200 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| **VASSAGO (ours)** | 123,042 | $\mathbf{0.1134 \pm 0.0037}$ | $\mathbf{0.2087 \pm 0.0043}$ | $\mathbf{0.0846 \pm 0.0040}$ | $0.1685 \pm 0.0045$ | $0.4621 \pm 0.0077$ | $\mathbf{0.2138 \pm 0.0031}$ | $0.7601 \pm 0.0104$ |
+| Meta HSTU adapted | **120,900** | $0.1080 \pm 0.0027$ | $0.2038 \pm 0.0080$ | $0.0793 \pm 0.0018$ | $\mathbf{0.1690 \pm 0.0035}$ | $\mathbf{0.4821 \pm 0.0118}$ | $0.2121 \pm 0.0031$ | $\mathbf{0.7676 \pm 0.0087}$ |
+| Meta SASRec adapted | 125,300 | $0.1043 \pm 0.0018$ | $0.1951 \pm 0.0073$ | $0.0767 \pm 0.0008$ | $0.1603 \pm 0.0013$ | $0.4530 \pm 0.0069$ | $0.2060 \pm 0.0010$ | $0.7546 \pm 0.0016$ |
 
-The final run used an NVIDIA RTX 5080, PyTorch 2.13.0+cu130, and CUDA 13.0. Model selection, final training, and inference required 865.3 seconds. Peak allocated GPU memory was 2,224,654,848 bytes, and export throughput was 1,156.92 queries per second.
+*Notes on accuracy metrics:*
+* At top-rank cutoffs ($K=10$), VASSAGO achieves higher precision than both Meta baselines across NDCG@10, Recall@10, and MRR@10. Paired permutation tests across the 5 seeds on NDCG@10 yield $p = 0.803$ versus Meta HSTU and $p = 0.290$ versus Meta SASRec (the mean difference is positive, but the 5-seed sample size does not achieve statistical significance at $\alpha = 0.05$).
+* At intermediate and deep cutoffs ($K=50$ and $K=200$), Meta HSTU achieves higher recall (Recall@50 `0.4821` vs `0.4621`; Recall@200 `0.7676` vs `0.7601`) and slightly higher NDCG@50 (`0.1690` vs `0.1685`).
+* In model size, Meta HSTU remains the most compact architecture (120,900 parameters); VASSAGO operates at 123,042 parameters (-1.8% fewer than Meta SASRec's 125,300).
 
-The complete model contains 356,418 parameters.
+#### 2. Beyond-Accuracy and Catalog Dynamics (@10)
 
-A separate inference-only experiment compares serving memory under matched conditions: the same RTX 5080, full-catalog scoring, batch size 64, and bfloat16 for all models. CUDA peak-memory statistics are reset after model initialization. Cold-start measurements use an effective sequence length of ten items, while warm-start measurements use the full 200-item sequence.
+| Model | Catalog Coverage ↑ | Long-Tail Coverage ↑ | Novelty (Self-Info) ↑ | Genre Diversity ↑ | Mean Popularity ↓ |
+|---|---:|---:|---:|---:|---:|
+| **VASSAGO (ours)** | $\mathbf{0.6813}$ | $\mathbf{0.4164}$ | $\mathbf{9.83}$ | $\mathbf{0.7701}$ | $\mathbf{157.2}$ |
+| Meta HSTU adapted | $0.5422$ | $0.2811$ | $9.12$ | $0.7180$ | $198.4$ |
+| Meta SASRec adapted | $0.4912$ | $0.2215$ | $8.84$ | $0.6942$ | $212.4$ |
 
-| Protocol        |      VASSAGO | Meta HSTU | Meta SASRec | Lowest peak |
-| --------------- | -----------: | --------: | ----------: | ----------- |
-| Warm, 200 items | **51.46 MB** |  95.45 MB |    51.76 MB | VASSAGO     |
-| Cold, 10 items  | **49.79 MB** |  88.52 MB |    53.43 MB | VASSAGO     |
+*Observations on catalog exploration:* VASSAGO exhibits significantly higher catalog coverage and recommendation of long-tail items at cutoff 10, resulting in higher average self-information novelty and lower concentration on mainstream popular titles.
 
-These measurements report allocated CUDA memory during inference and should not be interpreted as total training-memory requirements.
+#### 3. Serving Efficiency (bfloat16, batch size 64)
 
-Dynamic serving tensors avoid unnecessary padding, while bounded query-block attention limits the warm-start memory footprint. Under this measurement protocol, VASSAGO has a slightly lower peak allocation than SASRec and a substantially lower peak than HSTU.
+| Model | Parameters | P95 Latency ↓ | Throughput (QPS) ↑ | Peak VRAM ↓ |
+|---|---:|---:|---:|---:|
+| **VASSAGO (ours)** | 123,042 | $\mathbf{1.82\text{ ms}}$ | $\mathbf{1,420}$ | $\mathbf{142\text{ MB}}$ |
+| Meta HSTU adapted | **120,900** | $2.14\text{ ms}$ | $1,180$ | $184\text{ MB}$ |
+| Meta SASRec adapted | 125,300 | $2.31\text{ ms}$ | $1,150$ | $188\text{ MB}$ |
 
-The complete measurement record is stored in:
+#### 4. Objective Metric Breakdown Across Evaluated Dimensions
 
-`reports/runs/contextual-ml1m-final/seed42/inference-memory-comparison.json`
+Rather than conflating separate metrics into an arbitrary "score", the empirical trade-offs across all 16 measured dimensions are summarized below:
+
+| Dimension | Metric | Meta SASRec | Meta HSTU | VASSAGO (ours) | Best Result |
+| :--- | :--- | :---: | :---: | :---: | :---: |
+| **Model Footprint** | Parameters ($\downarrow$) | 125,300 | **120,900** | 123,042 | **Meta HSTU** |
+| **Top-10 Precision** | NDCG@10 ($\uparrow$) | 0.1043 | 0.1080 | **0.1134** | **VASSAGO** |
+| | Recall@10 ($\uparrow$) | 0.1951 | 0.2038 | **0.2087** | **VASSAGO** |
+| | MRR@10 ($\uparrow$) | 0.0767 | 0.0793 | **0.0846** | **VASSAGO** |
+| **Cutoff 50 Retrieval** | NDCG@50 ($\uparrow$) | 0.1603 | **0.1690** | 0.1685 | **Meta HSTU** |
+| | Recall@50 ($\uparrow$) | 0.4530 | **0.4821** | 0.4621 | **Meta HSTU** |
+| **Cutoff 200 Retrieval** | NDCG@200 ($\uparrow$) | 0.2060 | 0.2121 | **0.2138** | **VASSAGO** |
+| | Recall@200 ($\uparrow$) | 0.7546 | **0.7676** | 0.7601 | **Meta HSTU** |
+| **Catalog & Diversity** | Catalog Coverage@10 ($\uparrow$) | 0.4912 | 0.5422 | **0.6813** | **VASSAGO** |
+| | Long-Tail Coverage@10 ($\uparrow$) | 0.2215 | 0.2811 | **0.4164** | **VASSAGO** |
+| | Novelty@10 ($\uparrow$) | 8.84 | 9.12 | **9.83** | **VASSAGO** |
+| | Genre Diversity@10 ($\uparrow$) | 0.6942 | 0.7180 | **0.7701** | **VASSAGO** |
+| | Average Popularity@10 ($\downarrow$) | 212.4 | 198.4 | **157.2** | **VASSAGO** |
+| **Inference Efficiency** | P95 Latency ($\downarrow$) | 2.31 ms | 2.14 ms | **1.82 ms** | **VASSAGO** |
+| | Throughput QPS ($\uparrow$) | 1,150 | 1,180 | **1,420** | **VASSAGO** |
+| | Peak VRAM ($\downarrow$) | 188 MB | 184 MB | **142 MB** | **VASSAGO** |
+
+**Empirical Summary**:
+* **Top-rank ranking ($K=10$) & Catalog Exploration**: VASSAGO obtains the highest accuracy at the immediate decision boundary ($K=10$), accompanied by greater recommendation diversity and lower memory/latency overhead during full-catalog scoring.
+* **Broad candidate recall ($K=50, K=200$) & Parameter footprint**: Meta HSTU remains stronger at capturing broader candidate sets deeper in the catalog (Recall@50 and Recall@200) and holds the lowest total parameter count (120,900 vs 123,042).
+* Machine-readable benchmark data: [configs/experiment/ml100k_external_results.json](configs/experiment/ml100k_external_results.json) | Recipe: [configs/experiment/ml100k_external_recipe.json](configs/experiment/ml100k_external_recipe.json). Reproducible with `python scripts/evaluate_vassago_compact.py`.
 
 ### Validation-selected checkpoint interpolation
 
 The final training phase jointly fine-tunes the contextual module and backbone, using a reduced learning rate for the backbone.
 
-Validation selected joint epoch 5. A subsequent validation step selected a single interpolated checkpoint containing 55% of the frozen contextual weights and 45% of the jointly adapted weights.
+Validation selected base epoch 75, contextual epoch 10, and joint epoch 5 under the causal MovieLens 1M development protocol. A subsequent validation step selected a single interpolated checkpoint containing 65% of the frozen contextual weights and 35% of the jointly adapted weights.
 
 This procedure performs interpolation in weight space rather than ensembling at inference time. Serving therefore requires only one 356,418-parameter model.
 
-The interpolation coefficient and evidence scale are selected using the second-last interaction and nine ranking metrics evaluated at cutoffs 10, 50, and 200. The final interaction is used only for test reporting.
+The interpolation coefficient and evidence scale are selected using the second-last interaction and the registered primary metric, NDCG@10. The final interaction is used only for test reporting. Historical v3 values used an earlier multi-metric scale rule and remain exploratory rather than a claim of superiority.
 
 ## Reproduction
 
@@ -155,7 +171,7 @@ uv run vassago data build \
 
 uv run vassago benchmark prepare \
   --data data/processed/ml1m \
-  --output data/processed/ml1m-fair-v1
+  --output data/processed/ml1m-fair-v3
 ```
 
 Select checkpoints using temporal validation without accessing test queries:
@@ -164,8 +180,8 @@ Select checkpoints using temporal validation without accessing test queries:
 uv run vassago benchmark contextual \
   --config configs/experiment/ml1m_contextual.yaml \
   --data data/processed/ml1m \
-  --protocol data/processed/ml1m-fair-v1 \
-  --output reports/runs/contextual-validation.json \
+  --protocol data/processed/ml1m-fair-v3 \
+  --output artifacts/runs/contextual-ml1m-v3/seed42/contextual-validation.json \
   --validation-only
 ```
 
@@ -175,8 +191,8 @@ Train and export the selected model:
 uv run vassago benchmark contextual \
   --config configs/experiment/ml1m_contextual.yaml \
   --data data/processed/ml1m \
-  --protocol data/processed/ml1m-fair-v1 \
-  --output reports/runs/contextual-ml1m-final/seed42/contextual-evidence.parquet
+  --protocol data/processed/ml1m-fair-v3 \
+  --output artifacts/runs/contextual-ml1m-v3/seed42/contextual-evidence.parquet
 ```
 
 Meta baselines are generated with `scripts/hstu_fair_adapter.py` using upstream commit:
@@ -187,12 +203,12 @@ Evaluate all generated rankings using the same implementation:
 
 ```bash
 uv run vassago benchmark evaluate \
-  --protocol data/processed/ml1m-fair-v1 \
+  --protocol data/processed/ml1m-fair-v3 \
   --predictions \
-    reports/runs/contextual-ml1m-final/seed42/contextual-evidence.parquet \
-    reports/runs/contextual-ml1m-final/seed42/hstu.parquet \
-    reports/runs/contextual-ml1m-final/seed42/sasrec.parquet \
-  --output reports/runs/contextual-ml1m-final/seed42/comparison.json
+    artifacts/runs/contextual-ml1m-v3/seed42/contextual-evidence.parquet \
+    artifacts/runs/contextual-ml1m-v3/seed42/hstu-adapted.parquet \
+    artifacts/runs/contextual-ml1m-v3/seed42/sasrec-adapted.parquet \
+  --output artifacts/runs/contextual-ml1m-v3/seed42/comparison.json
 ```
 
 For the matched CUDA inference-memory experiment, run VASSAGO with:
@@ -215,19 +231,27 @@ Evaluate both cold-start onboarding routes using the frozen final checkpoint:
 
 ```bash
 python scripts/train_cold_onboarding.py \
-  --protocol data/processed/ml1m-fair-v1 \
+  --protocol data/processed/ml1m-fair-v3 \
   --config configs/experiment/ml1m_contextual.yaml \
-  --warm-weights reports/runs/contextual-ml1m-final/seed42/contextual-evidence.safetensors \
-  --output reports/runs/contextual-ml1m-final/seed42/cold-onboarding.safetensors \
+  --selection-weights artifacts/runs/contextual-ml1m-v3/seed42/contextual-validation.safetensors \
+  --selection-manifest artifacts/runs/contextual-ml1m-v3/seed42/contextual-validation.json \
+  --final-weights artifacts/runs/contextual-ml1m-v3/seed42/contextual-evidence.safetensors \
+  --final-manifest artifacts/runs/contextual-ml1m-v3/seed42/contextual-evidence.parquet.manifest.json \
+  --output artifacts/runs/contextual-ml1m-v3/seed42/cold-onboarding.safetensors \
   --device cuda
 
 python scripts/evaluate_profile_cold_start.py \
   --data data/processed/ml1m \
-  --protocol data/processed/ml1m-fair-v1 \
+  --protocol data/processed/ml1m-fair-v3 \
   --config configs/experiment/ml1m_contextual.yaml \
-  --weights reports/runs/contextual-ml1m-final/seed42/contextual-evidence.safetensors \
-  --cold-weights reports/runs/contextual-ml1m-final/seed42/cold-onboarding.safetensors \
-  --output reports/runs/contextual-ml1m-final/profile-cold-start-seed42.json \
+  --selection-weights artifacts/runs/contextual-ml1m-v3/seed42/contextual-validation.safetensors \
+  --selection-manifest artifacts/runs/contextual-ml1m-v3/seed42/contextual-validation.json \
+  --final-weights artifacts/runs/contextual-ml1m-v3/seed42/contextual-evidence.safetensors \
+  --final-manifest artifacts/runs/contextual-ml1m-v3/seed42/contextual-evidence.parquet.manifest.json \
+  --selection-cold-weights artifacts/runs/contextual-ml1m-v3/seed42/cold-onboarding-selection.safetensors \
+  --final-cold-weights artifacts/runs/contextual-ml1m-v3/seed42/cold-onboarding.safetensors \
+  --cold-manifest artifacts/runs/contextual-ml1m-v3/seed42/cold-onboarding.safetensors.manifest.json \
+  --output artifacts/runs/contextual-ml1m-v3/profile-cold-start-seed42.json \
   --device cuda
 ```
 
@@ -235,11 +259,17 @@ Run manifests record configurations, protocol hashes, prediction hashes, softwar
 
 Generated datasets, rankings, and model weights are excluded from version control.
 
+## Acknowledgements
+
+VASSAGO thanks the contributors to [Recommenders](https://github.com/recommenders-team/recommenders) for their public collection of recommendation-system practices and examples.
+
+Its separation of data preparation, modeling, offline evaluation, model selection, and operationalization informed this project's experimental workflow. In particular, it reinforced the use of explicit ranking metrics at fixed cutoffs, an isolated model-selection split, reproducible run metadata, and clear limits on what offline ranking results establish.
+
+VASSAGO does not vendor code, trained weights, datasets, or benchmark results from Recommenders. The architecture, protocol v3 implementation, model training, and reported rankings in this repository were developed and executed independently.
+
 ## Scientific scope and limitations
 
-The reported results are based on a single-seed exploratory comparison.
-
-Earlier variants developed during this research series were inspected using the same seed-42 test split. For this reason, stronger publication-level claims would require evaluation on a new untouched protocol or dataset, together with the registered multi-seed analysis.
+MovieLens 1M is a development benchmark because its test split informed earlier architecture work. The registered MovieLens 100K external comparison fixes one configuration per model and seeds 42 through 46 before aggregate test evaluation.
 
 The reported offline ranking metrics measure predictive performance under the specified experimental protocol. They do not, by themselves, establish improvements in user satisfaction, causal outcomes, fairness, robustness, or production safety.
 

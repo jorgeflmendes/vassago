@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "dataset": "MovieLens-100K",
+  "archive_md5": "0e33842e24a9c977be4e0107933c0723",
+  "protocol_hash": "dec219a93f4bea53aa4c04e0dfd639a6487da72765bc212e4d9ed755f36f0b3e",
+  "protocol": "ml-100k-leave-one-out-v3",
+  "primary_metric": "NDCG@10",
+  "secondary_metrics": ["Recall@10", "Recall@50", "NDCG@50", "Recall@200", "NDCG@200"],
+  "seeds": [42, 43, 44, 45, 46],
+  "models": {
+    "vassago": "configs/experiment/ml100k_external.yaml",
+    "hstu": "configs/ml-1m/hstu-sampled-softmax-n128-final.gin@6035c3f",
+    "sasrec": "configs/ml-1m/sasrec-sampled-softmax-n128-final.gin@6035c3f"
+  },
+  "configuration_trials_per_model": 1,
+  "selection_split": "second-last interaction",
+  "test_split": "final interaction",
+  "test_use": "aggregate once after all model and seed runs complete"
+}

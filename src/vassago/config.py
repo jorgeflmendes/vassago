@@ -13,11 +13,13 @@ class ExperimentConfig(BaseModel):
     contextual_joint_epochs: int = Field(default=0, ge=0)
     contextual_joint_backbone_lr_scale: float = Field(default=0.1, gt=0, le=1)
     contextual_memory_window: int = Field(default=32, ge=1)
+    contextual_persistence_scales: int = Field(default=0, ge=0, le=8)
     contextual_positions_per_user: int = Field(default=4, ge=1)
     contextual_groups: int = Field(default=8, ge=1)
     contextual_hard_negatives: bool = False
     contextual_heads: int = Field(default=1, ge=1, le=8)
     contextual_temperature: float = Field(default=0.1, gt=0)
+    contextual_velocity_scales: int = Field(default=0, ge=0, le=8)
     model_config = ConfigDict(extra="forbid")
     dataset: str = "synthetic"
     seed: int = 42
@@ -30,6 +32,7 @@ class ExperimentConfig(BaseModel):
     stacker_epochs: int = Field(default=5, ge=1)
     tokenizer_epochs: int = Field(default=10, ge=1)
     batch_size: int = Field(default=64, ge=1)
+    base_batch_size: int | None = Field(default=None, ge=1)
     sampled_negatives: int | None = Field(default=None, ge=1)
     learning_rate: float = Field(default=0.003, gt=0)
     weight_decay: float = Field(default=0.0001, ge=0)

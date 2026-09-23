@@ -13,9 +13,10 @@ import torch
 from safetensors.torch import load_file
 
 from vassago.config import ExperimentConfig
-from vassago.contextual_ranker import ContextualEvidenceRanker
+from vassago.contextual_ranker import ContextualEvidenceRanker, _query_timestamp_tensor
 from vassago.data import Movie
-from vassago.evaluation import paired_bootstrap
+from vassago.evaluation import deterministic_rank, paired_bootstrap
+from vassago.fair_benchmark import FairProtocol, sha256, validate_weight_provenance
 from vassago.hybrid_serving import CollaborativeProfileProjector
 from vassago.serving import UserPreferenceProfile
 
@@ -40,12 +41,44 @@ def _validation_rows(interactions: Path) -> tuple[list[dict[str, Any]], np.ndarr
         rows.append(
             {
                 "history": history,
+                "history_timestamps": sequence["timestamps"][:-2],
                 "seen": sorted(set(history)),
                 "target": sequence["items"][-2],
-                "timestamp": sequence["timestamps"][-2],
+                "timestamp": sequence["timestamps"][-3],
             }
         )
     return rows, popularity
+
+
+def _pretest_counts(interactions: Path) -> np.ndarray:
+    frame = pl.read_parquet(interactions).sort(["user_id", "timestamp", "movie_id"])
+    maximum_movie_id: Any = frame["movie_id"].max()
+    if maximum_movie_id is None:
+        raise ValueError("interactions contain no movie IDs")
+    popularity = np.zeros(int(maximum_movie_id) + 1, dtype=np.float32)
+    for sequence in frame.group_by("user_id", maintain_order=True).agg("movie_id").iter_rows():
+        np.add.at(popularity, np.asarray(sequence[1][:-1], dtype=int), 1)
+    return popularity
+
+
+def _load_model(
+    item_count: int, config: ExperimentConfig, weights: Path, device: str
+) -> ContextualEvidenceRanker:
+    model = ContextualEvidenceRanker(
+        item_count,
+        config.dimension,
+        config.max_length,
+        config.heads,
+        config.layers,
+        config.dropout,
+        config.contextual_dimension,
+        config.contextual_memory_window,
+        config.contextual_temperature,
+        config.contextual_heads,
+        config.contextual_persistence_scales,
+    ).to(device)
+    model.load_state_dict(load_file(weights, device=device), strict=True)
+    return model.eval()
 
 
 def _profile(movies: list[Movie], history: list[int]) -> UserPreferenceProfile:
@@ -78,7 +111,6 @@ def _evaluate(
         allowed = np.ones(len(movies), dtype=bool)
         allowed[np.asarray(row["seen"], dtype=int) - 1] = False
         allowed &= years <= row["timestamp"]
-        eligible = np.flatnonzero(allowed)
         target = int(row["target"]) - 1
         for weight in weights:
             scores = {
@@ -86,7 +118,7 @@ def _evaluate(
                 "popularity": projector.popularity,
             }
             for name, score in scores.items():
-                rank = 1 + int(np.sum(score[eligible] > score[target]))
+                rank = deterministic_rank(score, target, allowed)
                 values[weight][name].append(
                     1 / np.log2(rank + 1) if rank <= 10 else 0.0
                 )
@@ -119,10 +151,22 @@ def _favorite_score_components(
 ) -> tuple[np.ndarray, np.ndarray]:
     device = next(model.parameters()).device
     histories = torch.zeros(len(batch), max_length, dtype=torch.long, device=device)
+    timestamps = torch.zeros_like(histories)
     for index, row in enumerate(batch):
         favorites = row["history"][-length:]
+        favorite_timestamps = row["history_timestamps"][-length:]
         histories[index, : len(favorites)] = torch.tensor(favorites, device=device)
-    contextual = model.score(histories)[1]
+        timestamps[index, : len(favorite_timestamps)] = torch.tensor(
+            favorite_timestamps, device=device
+        )
+    query_timestamps = _query_timestamp_tensor(
+        timestamps,
+        histories.ne(0).sum(1),
+        torch.tensor([row["timestamp"] for row in batch], device=device),
+    )
+    contextual = model.score(
+        histories, timestamps=timestamps, query_timestamps=query_timestamps
+    )[1]
     item_vectors = model.backbone.item_vectors()
     centroids = []
     for row in batch:
@@ -157,7 +201,7 @@ def _evaluate_favorites(
                     allowed[0] = False
                     allowed[row["seen"]] = False
                     target = int(row["target"])
-                    rank = 1 + int(np.sum(scores[index, allowed] > scores[index, target]))
+                    rank = deterministic_rank(scores[index], target, allowed)
                     if rank <= 10:
                         totals[(length, weight)][0] += 1 / np.log2(rank + 1)
                         totals[(length, weight)][1] += 1
@@ -228,12 +272,21 @@ def main() -> None:
     parser.add_argument("--data", type=Path, required=True)
     parser.add_argument("--protocol", type=Path, required=True)
     parser.add_argument("--config", type=Path, required=True)
-    parser.add_argument("--weights", type=Path, required=True)
+    parser.add_argument("--selection-weights", type=Path, required=True)
+    parser.add_argument("--selection-manifest", type=Path, required=True)
+    parser.add_argument("--final-weights", type=Path, required=True)
+    parser.add_argument("--final-manifest", type=Path, required=True)
     parser.add_argument(
-        "--cold-weights",
+        "--selection-cold-weights",
         type=Path,
-        help="Optional validation-selected onboarding adapter checkpoint",
+        help="Optional cold adapter selected without the validation target",
     )
+    parser.add_argument(
+        "--final-cold-weights",
+        type=Path,
+        help="Optional cold adapter retrained from the final warm checkpoint",
+    )
+    parser.add_argument("--cold-manifest", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--rankings-output", type=Path)
     parser.add_argument("--device", default="cpu")
@@ -245,49 +298,76 @@ def main() -> None:
     ]
     validation, counts = _validation_rows(args.data / "interactions.parquet")
     config = ExperimentConfig.read(args.config).model_copy(update={"device": args.device})
-    model = ContextualEvidenceRanker(
-        len(movies),
-        config.dimension,
-        config.max_length,
-        config.heads,
-        config.layers,
-        config.dropout,
-        config.contextual_dimension,
-        config.contextual_memory_window,
-        config.contextual_temperature,
-        config.contextual_heads,
-    ).to(args.device)
-    model.load_state_dict(load_file(args.weights, device=args.device), strict=True)
-    model.eval()
-    cold_model = model
-    if args.cold_weights is not None:
-        cold_model = ContextualEvidenceRanker(
-            len(movies),
-            config.dimension,
-            config.max_length,
-            config.heads,
-            config.layers,
-            config.dropout,
-            config.contextual_dimension,
-            config.contextual_memory_window,
-            config.contextual_temperature,
-            config.contextual_heads,
-        ).to(args.device)
-        cold_model.load_state_dict(
-            load_file(args.cold_weights, device=args.device), strict=True
-        )
-        cold_model.eval()
-    projector = CollaborativeProfileProjector(
-        movies, model.backbone.item_vectors().detach().cpu().numpy(), counts
+    protocol = FairProtocol.model_validate_json(
+        (args.protocol / "protocol.json").read_text(encoding="utf-8")
+    )
+    if protocol.protocol_hash != protocol.expected_hash():
+        raise ValueError("Protocol manifest hash is invalid")
+    if sha256(args.data / "interactions.parquet") != protocol.interactions_sha256:
+        raise ValueError("Interactions do not match the protocol")
+    if sha256(args.data / "catalog.json") != protocol.catalog_sha256:
+        raise ValueError("Catalog does not match the protocol")
+    if sha256(args.protocol / "queries.parquet") != protocol.queries_sha256:
+        raise ValueError("Protocol query artifact has changed")
+    validate_weight_provenance(
+        args.selection_weights,
+        args.selection_manifest,
+        args.final_weights,
+        args.final_manifest,
+        protocol.protocol_hash,
+    )
+    if (args.selection_cold_weights is None) != (args.final_cold_weights is None):
+        parser.error("selection and final cold weights must be supplied together")
+    if (args.selection_cold_weights is None) != (args.cold_manifest is None):
+        parser.error("cold weights and their manifest must be supplied together")
+    if args.cold_manifest is not None:
+        cold_manifest = json.loads(args.cold_manifest.read_text(encoding="utf-8"))
+        expected_cold_provenance = {
+            "protocol_hash": protocol.protocol_hash,
+            "selection_weights_sha256": sha256(args.selection_weights),
+            "final_weights_sha256": sha256(args.final_weights),
+            "selection_adapter_sha256": sha256(args.selection_cold_weights),
+            "output_sha256": sha256(args.final_cold_weights),
+        }
+        actual_cold_provenance = {
+            "protocol_hash": cold_manifest.get("protocol_hash"),
+            "selection_weights_sha256": cold_manifest.get("selection_weights_sha256"),
+            "final_weights_sha256": cold_manifest.get("final_weights_sha256"),
+            "selection_adapter_sha256": cold_manifest.get("selection_adapter", {}).get(
+                "sha256"
+            ),
+            "output_sha256": cold_manifest.get("output_sha256"),
+        }
+        if actual_cold_provenance != expected_cold_provenance:
+            raise ValueError("Cold adapter weights do not match their manifest")
+    selection_model = _load_model(len(movies), config, args.selection_weights, args.device)
+    final_model = _load_model(len(movies), config, args.final_weights, args.device)
+    selection_cold_model = (
+        _load_model(len(movies), config, args.selection_cold_weights, args.device)
+        if args.selection_cold_weights is not None
+        else selection_model
+    )
+    final_cold_model = (
+        _load_model(len(movies), config, args.final_cold_weights, args.device)
+        if args.final_cold_weights is not None
+        else final_model
+    )
+    selection_projector = CollaborativeProfileProjector(
+        movies, selection_model.backbone.item_vectors().detach().cpu().numpy(), counts
+    )
+    final_projector = CollaborativeProfileProjector(
+        movies,
+        final_model.backbone.item_vectors().detach().cpu().numpy(),
+        _pretest_counts(args.data / "interactions.parquet"),
     )
     grid = [index / 10 for index in range(11)]
-    validation_results = _evaluate(validation, movies, projector, grid)
+    validation_results = _evaluate(validation, movies, selection_projector, grid)
     selected = max(grid, key=lambda weight: validation_results[weight]["profile_ndcg10"])
     favorite_grid = [1, 3, 5, 10]
     centroid_weight_grid = [0.0, 0.025, 0.05, 0.1, 0.15, 0.2, 0.3]
     favorite_validation = _evaluate_favorites(
         validation,
-        cold_model,
+        selection_cold_model,
         config.max_length,
         favorite_grid,
         centroid_weight_grid,
@@ -313,7 +393,7 @@ def main() -> None:
         "test": {
             "split": "final interaction",
             "queries": len(test),
-            "results": _evaluate(test, movies, projector, [selected])[selected],
+            "results": _evaluate(test, movies, final_projector, [selected])[selected],
         },
         "favorite_onboarding": {
             "method": (
@@ -332,33 +412,37 @@ def main() -> None:
             },
             "test": _evaluate_favorites(
                 test,
-                cold_model,
+                final_cold_model,
                 config.max_length,
                 [selected_favorites],
                 [selected_centroid_weight],
             )[(selected_favorites, selected_centroid_weight)],
         },
         "cold_adapter": {
-            "weights": str(args.cold_weights) if args.cold_weights else None,
-            "sha256": (
-                hashlib.sha256(args.cold_weights.read_bytes()).hexdigest()
-                if args.cold_weights
-                else None
-            ),
+            "selection_weights": str(args.selection_cold_weights)
+            if args.selection_cold_weights
+            else None,
+            "selection_sha256": hashlib.sha256(args.selection_cold_weights.read_bytes()).hexdigest()
+            if args.selection_cold_weights
+            else None,
+            "final_weights": str(args.final_cold_weights) if args.final_cold_weights else None,
+            "final_sha256": hashlib.sha256(args.final_cold_weights.read_bytes()).hexdigest()
+            if args.final_cold_weights
+            else None,
         },
+        "protocol_hash": protocol.protocol_hash,
         "warm_start_contract": "one or more positive interactions bypass the profile expert",
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     if args.rankings_output is not None:
-        protocol = json.loads((args.protocol / "protocol.json").read_text(encoding="utf-8"))
         _export_favorite_rankings(
             test,
-            cold_model,
+            final_cold_model,
             config.max_length,
             selected_favorites,
             selected_centroid_weight,
-            protocol["protocol_hash"],
+            protocol.protocol_hash,
             config.seed,
             args.rankings_output,
         )

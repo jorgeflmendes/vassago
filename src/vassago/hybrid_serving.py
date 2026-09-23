@@ -245,6 +245,8 @@ class ParetoHybridRecommender:
             config.contextual_memory_window,
             config.contextual_temperature,
             config.contextual_heads,
+            config.contextual_persistence_scales,
+            config.contextual_velocity_scales,
         ).to(device)
         model.load_state_dict(load_file(weights_path, device=device), strict=True)
         cold_model = None
@@ -260,6 +262,8 @@ class ParetoHybridRecommender:
                 config.contextual_memory_window,
                 config.contextual_temperature,
                 config.contextual_heads,
+                config.contextual_persistence_scales,
+                config.contextual_velocity_scales,
             ).to(device)
             cold_model.load_state_dict(
                 load_file(cold_weights_path, device=device), strict=True
