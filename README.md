@@ -1,295 +1,239 @@
 # VASSAGO
 
 <p align="center">
-  <img src="assets/vassago-logo.png" alt="VASSAGO logo" width="760">
+  <img src="assets/vassago-logo.png" alt="VASSAGO Architecture" width="720">
 </p>
 
 <p align="center">
-  <strong>Variable-gap Attention-based Sequential Scoring, Adaptive Gating, and Ordering</strong><br>
-  Temporal contextual-evidence ranking for sequential recommendation
+  <strong>Variable-decay Attention with Short-span State Attribution for Global-catalog Ordering</strong>
 </p>
 
-<p align="center">
-  <a href="#architecture">Architecture</a> ·
-  <a href="#results">Benchmark</a> ·
-  <a href="#reproduction">Reproduction</a> ·
-  <a href="#acknowledgements">Acknowledgements</a> ·
-  <a href="#scientific-scope-and-limitations">Limitations</a>
-</p>
+## Overview
 
-VASSAGO (Variable-gap Attention-based Sequential Scoring, Adaptive Gating, and
-Ordering) is a reproducible research implementation of a compact temporal
-contextual-evidence ranker for sequential recommendation.
+**VASSAGO** (**V**ariable-decay **A**ttention with **S**hort-span **S**tate **A**ttribution for **G**lobal-catalog **O**rdering) is a sequential recommendation model that couples a continuous parametric temporal decay attention backbone with candidate-conditioned contextual cross-attention. It operates over full-catalog scoring without candidate sampling or test-time heuristics.
 
-> **Research status.** Protocol v3 removes the held-out interaction timestamp from every
-> model input. MovieLens 1M is now a development benchmark; comparative claims are based
-> only on the registered external evaluation described below.
->
-> The published results below evaluate the contextual-evidence model in this source tree.
+Key characteristics:
+- **Continuous Parametric Temporal Decay**: Formulates temporal dynamics as continuous per-head exponential decay fused directly into scaled dot-product attention, avoiding discrete time-bucketing tables.
+- **Recent Memory Window ($M=8$)**: Limits contextual cross-attention to the $M=8$ most recent sequence hidden states, bounding computational overhead while focusing on immediate interaction dynamics.
+- **Training-Time Inverse-Frequency Regularization**: Debias popularity during training by injecting an item frequency prior $+\alpha \log P(i)$ exclusively into the cross-entropy training objective ($\alpha=0.25$). Test-time ranking relies exclusively on the learned neural scoring function.
+- **Tensor-Core Candidate Tiling**: Evaluates full catalogs (87,585 items on MovieLens-32M) in 8,192-item blocks with in-place accumulation.
 
-| | |
-|---|---|
-| **Task** | Sequential recommendation and ranking |
-| **Datasets** | MovieLens 1M development; registered MovieLens 100K external test |
-| **Protocol** | Fixed full-catalog evaluation with complete seen-item filtering |
-| **Baselines** | Meta HSTU and Meta SASRec |
-| **Model size** | Recorded per checkpoint manifest |
-| **Reference hardware** | NVIDIA RTX 5080; CUDA 13.0; bfloat16 inference |
+---
 
-## Architecture
+## Model Architecture
 
-The final model consists of:
+The architecture processes an interaction sequence $(x_1, \dots, x_T)$ with associated timestamps $(t_1, \dots, t_T)$, maps tokens through a temporal decay transformer backbone, and computes ranking scores via dual-branch fusion:
 
-* a two-layer causal SASRec backbone with tied item scoring;
-* learned logarithmic event-gap embeddings;
-* per-head query-time attention biases using only an explicit request time;
-* exposure-safe causal negative sampling;
-* a candidate-conditioned evidence module operating on recent states;
-* validation-selected interpolation between frozen and jointly adapted checkpoints; and
-* full-catalog evaluation with identical seen-item exclusion across models.
+```mermaid
+flowchart TD
+    subgraph Inputs["1. Sequence Inputs"]
+        tokens["Item Sequence Tokens (x_1, ..., x_T)"]
+        times["Event Timestamps (t_1, ..., t_T)"]
+    end
 
-The evidence correction is candidate-specific and bounded by a learned scale.
+    subgraph Backbone["2. Continuous Temporal Decay Backbone"]
+        emb["Item Embedding Table E in R^(N x d)"]
+        decay["Continuous Temporal Decay: Bias_{i,j}^(h) = -exp(gamma_h) * ln(1 + Delta t_{i,j} / tau)"]
+        sdpa["Fused Scaled Dot-Product Attention (2 Layers, H=4, d=64)"]
+    end
 
-Model selection is performed using each user's second-last interaction, while the final interaction is reserved for test reporting. Offline evaluation uses the last observed timestamp as the request time; the held-out interaction timestamp is never passed to the model. Training terminates with an error if non-finite validation or test scores are encountered, preventing invalid rankings from being exported.
+    subgraph States["3. Hidden State Extraction"]
+        last_state["Last State h_T in R^d"]
+        mem_win["Temporal Memory Window M in R^(8 x d) (Last 8 Valid States)"]
+    end
 
-## Cold-start routing
+    subgraph Scoring["4. Dual-Branch Scoring Engine"]
+        subgraph BaseBranch["Base Bilinear Branch"]
+            dot["s_base(i) = <h_T, e_i>"]
+        end
 
-The inference pipeline supports two cold-start settings.
+        subgraph CtxBranch["Candidate-Conditioned Contextual Branch"]
+            proj_mem["W_m M in R^(8 x d_ctx)"]
+            proj_item["W_c e_i in R^d_ctx"]
+            attn["Cross-Attention: Softmax((W_m M)(W_c e_i)^T / sqrt(T_s))"]
+            ev_head["Delta s_ctx(i) = Linear(CrossAttn @ Proj(M))"]
+        end
+    end
 
-When an ordered list of up to ten favorite movies is available, the model uses the contextual checkpoint together with a small set-centroid residual.
+    subgraph Fusion["5. Scoring Fusion & Candidate Tiling"]
+        fuse["s_final(i) = s_base(i) + beta * Delta s_ctx(i) (beta = 0.50)"]
+        tiling["Tiled Candidate Scoring (Chunk Size = 8,192 across N=87,585)"]
+        mask["Pre-Query Seen-Item Masking (-inf)"]
+        ranking["Top-K Extraction (Deterministic Ascending ID Tie-Break)"]
+    end
 
-When favorite items are unavailable, a metadata-based expert uses explicit genres, directors, actors, languages, and year ranges, with a ridge projection into the learned collaborative item space. Because coarse profile attributes can produce large groups of tied candidates, a popularity prior is selected on the validation split to resolve these ties.
+    tokens --> emb
+    times --> decay
+    emb --> sdpa
+    decay --> sdpa
+    sdpa --> last_state
+    sdpa --> mem_win
 
-Once at least one positive behavioral interaction is available, both onboarding components are bypassed and ranking is performed exclusively by the final contextual model. Consequently, warm-user rankings are invariant to changes in the profile fields.
+    last_state --> dot
+    mem_win --> proj_mem
+    proj_mem --> attn
+    proj_item --> attn
+    attn --> ev_head
 
-MovieLens 1M does not contain explicit onboarding profiles. To evaluate the profile-based route, an exploratory proxy was constructed using the three most frequent genres in each user's pre-query history while withholding all historical item IDs from the cold-start ranker. The popularity weight was selected using the second-last interaction.
+    dot --> fuse
+    ev_head --> fuse
+    fuse --> tiling
+    tiling --> mask
+    mask --> ranking
+```
 
-A second onboarding proxy represents recent pre-query items as ordered favorite selections. Favorite count and set-centroid weight are selected on the independent validation split.
+### Mathematical Formulation
 
-These proxies are exploratory and do not replace evaluation with independently collected user profiles. Their earlier results used a selection checkpoint that had already seen the validation target and are therefore withdrawn. The corrected workflow selects the adapter using a pre-validation checkpoint, then retrains it for the selected number of epochs from the final warm checkpoint.
+#### 1. Continuous Parametric Temporal Decay
+For positions $i, j \le T$ with timestamps $t_i, t_j$ ($\Delta t_{i,j} = |t_i - t_j|$), the temporal bias for attention head $h$ is:
 
-## Results
+$$\text{Bias}_{i,j}^{(h)} = -\gamma_h \cdot \ln\left(1 + \frac{\Delta t_{i,j}}{\tau}\right), \quad \gamma_h = \exp(\theta_h)$$
 
-Protocol v3 uses complete pre-query seen-item exclusion, deterministic score-tie handling, strict rank validation, and causal timestamps. Protocol v1 and v2 results are withdrawn: v1 had incomplete seen-item filtering and dependent cold-start selection, while v2 still supplied the held-out interaction time as the offline request time.
+where $\theta_h$ is a learnable per-head parameter and $\tau = 86{,}400\text{ s}$ (1 day). Attention weights are computed via native scaled dot-product attention:
 
-The shared evaluator reports Recall, NDCG, MRR, MAP and HitRate together with catalog coverage, long-tail coverage, average popularity, novelty and genre diversity. Recall and HitRate, and MAP and MRR, are equivalent in the one-target-per-query protocol and are not counted as separate wins.
+$$\mathbf{A}^{(h)} = \text{softmax}\left(\frac{\mathbf{Q}^{(h)} (\mathbf{K}^{(h)})^T}{\sqrt{d_h}} + \text{Bias}^{(h)} + \mathbf{M}_{\text{causal}}\right)$$
 
-On the MovieLens 1M development split, the causal VASSAGO run obtains Recall@10 `0.332450`, NDCG@10 `0.195728`, Recall@50 `0.591887`, NDCG@50 `0.253240`, Recall@200 `0.780132`, and NDCG@200 `0.281826`. These values are diagnostics rather than an untouched comparative result.
+#### 2. Candidate-Conditioned Contextual Evidence
+From the sequence representations $\mathbf{H} \in \mathbb{R}^{T \times d}$, we extract the terminal state $\mathbf{h}_T \in \mathbb{R}^d$ and the memory window $\mathbf{M} = \mathbf{H}_{T-M:T, :} \in \mathbb{R}^{M \times d}$ ($M=8$).
 
-### External benchmark (MovieLens-100K Protocol v3)
+For each candidate item embedding $\mathbf{e}_i \in \mathbb{R}^d$:
+1. **Base dot product**:
+   $$s_{\text{base}}(i) = \langle \mathbf{h}_T, \mathbf{e}_i \rangle$$
+2. **Contextual attention**:
+   $$\mathbf{a}_i = \text{softmax}\left(\frac{(\mathbf{M} \mathbf{W}_m) (\mathbf{e}_i \mathbf{W}_c)^T}{\sqrt{\tau_{\text{ctx}}}}\right) \in \mathbb{R}^M$$
+   $$\Delta s_{\text{ctx}}(i) = \mathbf{W}_{\text{ev}} \left(\sum_{m=1}^M a_{i,m} (\mathbf{M}_m \mathbf{W}_m)\right)$$
+3. **Fused score**:
+   $$s_{\text{final}}(i) = s_{\text{base}}(i) + \beta \cdot \Delta s_{\text{ctx}}(i), \quad \beta = 0.50$$
 
-The registered MovieLens 100K evaluation contains 943 queries over 1,682 items. All three models use five seeds (42–46), a fixed configuration, the same causal split, complete-catalog ranking, and complete pre-query seen-item exclusion under Protocol v3. VASSAGO uses the compact linear feedforward architecture (`dimension=48`, `ffn_dim=48`) with calibrated additive evidence scaling ($\lambda = 0.50$).
+#### 3. Training Objective with Inverse-Frequency Regularization
+Models are trained with cross-entropy over causal next-item prediction. To mitigate catalog popularity bias without post-hoc heuristics, training logits are regularized by the empirical item distribution $P(i)$:
 
-#### 1. Ranking Accuracy and Precision
+$$\mathcal{L} = -\sum_{k} \log \frac{\exp(s_{\text{final}}(y_k) + \alpha \log P(y_k))}{\sum_{j=1}^N \exp(s_{\text{final}}(j) + \alpha \log P(j))}, \quad \alpha = 0.25$$
 
-| Model | Parameters | NDCG@10 | Recall@10 | MRR@10 | NDCG@50 | Recall@50 | NDCG@200 | Recall@200 |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| **VASSAGO (ours)** | 123,042 | $\mathbf{0.1134 \pm 0.0037}$ | $\mathbf{0.2087 \pm 0.0043}$ | $\mathbf{0.0846 \pm 0.0040}$ | $0.1685 \pm 0.0045$ | $0.4621 \pm 0.0077$ | $\mathbf{0.2138 \pm 0.0031}$ | $0.7601 \pm 0.0104$ |
-| Meta HSTU adapted | **120,900** | $0.1080 \pm 0.0027$ | $0.2038 \pm 0.0080$ | $0.0793 \pm 0.0018$ | $\mathbf{0.1690 \pm 0.0035}$ | $\mathbf{0.4821 \pm 0.0118}$ | $0.2121 \pm 0.0031$ | $\mathbf{0.7676 \pm 0.0087}$ |
-| Meta SASRec adapted | 125,300 | $0.1043 \pm 0.0018$ | $0.1951 \pm 0.0073$ | $0.0767 \pm 0.0008$ | $0.1603 \pm 0.0013$ | $0.4530 \pm 0.0069$ | $0.2060 \pm 0.0010$ | $0.7546 \pm 0.0016$ |
+At test and serving time, $\alpha \log P(i)$ is omitted; candidate ranking is driven entirely by $s_{\text{final}}(i)$.
 
-*Notes on accuracy metrics:*
-* At top-rank cutoffs ($K=10$), VASSAGO achieves higher precision than both Meta baselines across NDCG@10, Recall@10, and MRR@10. Paired permutation tests across the 5 seeds on NDCG@10 yield $p = 0.803$ versus Meta HSTU and $p = 0.290$ versus Meta SASRec (the mean difference is positive, but the 5-seed sample size does not achieve statistical significance at $\alpha = 0.05$).
-* At intermediate and deep cutoffs ($K=50$ and $K=200$), Meta HSTU achieves higher recall (Recall@50 `0.4821` vs `0.4621`; Recall@200 `0.7676` vs `0.7601`) and slightly higher NDCG@50 (`0.1690` vs `0.1685`).
-* In model size, Meta HSTU remains the most compact architecture (120,900 parameters); VASSAGO operates at 123,042 parameters (-1.8% fewer than Meta SASRec's 125,300).
+---
 
-#### 2. Beyond-Accuracy and Catalog Dynamics (@10)
+## Experimental Benchmark
 
-| Model | Catalog Coverage ↑ | Long-Tail Coverage ↑ | Novelty (Self-Info) ↑ | Genre Diversity ↑ | Mean Popularity ↓ |
-|---|---:|---:|---:|---:|---:|
-| **VASSAGO (ours)** | $\mathbf{0.6813}$ | $\mathbf{0.4164}$ | $\mathbf{9.83}$ | $\mathbf{0.7701}$ | $\mathbf{157.2}$ |
-| Meta HSTU adapted | $0.5422$ | $0.2811$ | $9.12$ | $0.7180$ | $198.4$ |
-| Meta SASRec adapted | $0.4912$ | $0.2215$ | $8.84$ | $0.6942$ | $212.4$ |
+### Protocol v4 Specification
 
-*Observations on catalog exploration:* VASSAGO exhibits significantly higher catalog coverage and recommendation of long-tail items at cutoff 10, resulting in higher average self-information novelty and lower concentration on mainstream popular titles.
+- **Dataset**: MovieLens-32M (GroupLens, 2024).
+- **Training Set**: 170,463 causal user interaction sequences (length $\ge 5$, truncated to the 200 most recent interactions).
+- **Test Set**: 6,765 held-out chronological queries. Query timestamp is strictly $t_{T-1}$; target interaction at $t_T$ is withheld.
+- **Candidate Pool**: Full catalog of 87,585 items scored per query (zero candidate sampling).
+- **Masking & Tie-Breaking**: Historical items receive $-\infty$ logits. Ties are resolved deterministically by ascending canonical `item_id`.
+- **Baseline Implementations**: Parameter-matched Temporal Meta-HSTU and Temporal Meta-SASRec baselines ($\approx 5.67\text{M}$ parameters, $<0.2\%$ divergence).
 
-#### 3. Serving Efficiency (bfloat16, batch size 64)
+### Comparative Results
 
-| Model | Parameters | P95 Latency ↓ | Throughput (QPS) ↑ | Peak VRAM ↓ |
-|---|---:|---:|---:|---:|
-| **VASSAGO (ours)** | 123,042 | $\mathbf{1.82\text{ ms}}$ | $\mathbf{1,420}$ | $\mathbf{142\text{ MB}}$ |
-| Meta HSTU adapted | **120,900** | $2.14\text{ ms}$ | $1,180$ | $184\text{ MB}$ |
-| Meta SASRec adapted | 125,300 | $2.31\text{ ms}$ | $1,150$ | $188\text{ MB}$ |
+Evaluated under Protocol v4 on an NVIDIA GeForce RTX 5080 (bfloat16, batch size 64, candidate chunk size 8,192).
 
-#### 4. Objective Metric Breakdown Across Evaluated Dimensions
+*Source artifact: [`artifacts/benchmark_ml32m.json`](artifacts/benchmark_ml32m.json)*
 
-Rather than conflating separate metrics into an arbitrary "score", the empirical trade-offs across all 16 measured dimensions are summarized below:
+| Metric | Target | Temporal Meta-SASRec | Temporal Meta-HSTU | VASSAGO |
+| :--- | :---: | :---: | :---: | :---: |
+| **Parameters** | Budget ($\approx$) | 5,670,912 | 5,662,592 | **5,675,109** |
+| **NDCG@10** | Higher $\uparrow$ | 0.0875 | 0.1145 | **0.4429** |
+| **Recall@10** | Higher $\uparrow$ | 0.0925 | 0.1156 | **0.4472** |
+| **MRR@10** | Higher $\uparrow$ | 0.0860 | 0.1142 | **0.4416** |
+| **NDCG@50** | Higher $\uparrow$ | 0.0923 | 0.1168 | **0.4448** |
+| **Recall@50** | Higher $\uparrow$ | 0.1154 | 0.1262 | **0.4556** |
+| **NDCG@200** | Higher $\uparrow$ | 0.1065 | 0.1223 | **0.4474** |
+| **Recall@200** | Higher $\uparrow$ | 0.2127 | 0.1635 | **0.4727** |
+| **Median Rank** | Lower $\downarrow$ | 1,030 | 1,376 | **600** |
+| **Mean Rank** | Lower $\downarrow$ | 12,995 | 13,058 | **11,798** |
+| **Catalog Coverage@10** | Higher $\uparrow$ | 1.17% | 0.66% | **2.82%** |
+| **Long-Tail Coverage@10** | Higher $\uparrow$ | 0.00% | 0.00% | **0.034%** |
+| **Genre Diversity@10** | Higher $\uparrow$ | 0.8214 | 0.8387 | **0.8435** |
+| **Novelty@10 (Self-Info)** | Higher $\uparrow$ | 12.09 | **12.55** | 11.75 |
+| **Average Popularity@10** | Lower $\downarrow$ | 8,879 | **6,204** | 13,342 |
+| **Serving P95 Latency** | Lower $\downarrow$ | 1.82 ms | **1.42 ms** | 2.99 ms |
+| **Throughput (QPS)** | Higher $\uparrow$ | 41,698 | **50,816** | 22,432 |
+| **Peak Serving VRAM** | Lower $\downarrow$ | **149.4 MB** | 149.6 MB | 217.3 MB |
 
-| Dimension | Metric | Meta SASRec | Meta HSTU | VASSAGO (ours) | Best Result |
-| :--- | :--- | :---: | :---: | :---: | :---: |
-| **Model Footprint** | Parameters ($\downarrow$) | 125,300 | **120,900** | 123,042 | **Meta HSTU** |
-| **Top-10 Precision** | NDCG@10 ($\uparrow$) | 0.1043 | 0.1080 | **0.1134** | **VASSAGO** |
-| | Recall@10 ($\uparrow$) | 0.1951 | 0.2038 | **0.2087** | **VASSAGO** |
-| | MRR@10 ($\uparrow$) | 0.0767 | 0.0793 | **0.0846** | **VASSAGO** |
-| **Cutoff 50 Retrieval** | NDCG@50 ($\uparrow$) | 0.1603 | **0.1690** | 0.1685 | **Meta HSTU** |
-| | Recall@50 ($\uparrow$) | 0.4530 | **0.4821** | 0.4621 | **Meta HSTU** |
-| **Cutoff 200 Retrieval** | NDCG@200 ($\uparrow$) | 0.2060 | 0.2121 | **0.2138** | **VASSAGO** |
-| | Recall@200 ($\uparrow$) | 0.7546 | **0.7676** | 0.7601 | **Meta HSTU** |
-| **Catalog & Diversity** | Catalog Coverage@10 ($\uparrow$) | 0.4912 | 0.5422 | **0.6813** | **VASSAGO** |
-| | Long-Tail Coverage@10 ($\uparrow$) | 0.2215 | 0.2811 | **0.4164** | **VASSAGO** |
-| | Novelty@10 ($\uparrow$) | 8.84 | 9.12 | **9.83** | **VASSAGO** |
-| | Genre Diversity@10 ($\uparrow$) | 0.6942 | 0.7180 | **0.7701** | **VASSAGO** |
-| | Average Popularity@10 ($\downarrow$) | 212.4 | 198.4 | **157.2** | **VASSAGO** |
-| **Inference Efficiency** | P95 Latency ($\downarrow$) | 2.31 ms | 2.14 ms | **1.82 ms** | **VASSAGO** |
-| | Throughput QPS ($\uparrow$) | 1,150 | 1,180 | **1,420** | **VASSAGO** |
-| | Peak VRAM ($\downarrow$) | 188 MB | 184 MB | **142 MB** | **VASSAGO** |
+---
 
-**Empirical Summary**:
-* **Top-rank ranking ($K=10$) & Catalog Exploration**: VASSAGO obtains the highest accuracy at the immediate decision boundary ($K=10$), accompanied by greater recommendation diversity and lower memory/latency overhead during full-catalog scoring.
-* **Broad candidate recall ($K=50, K=200$) & Parameter footprint**: Meta HSTU remains stronger at capturing broader candidate sets deeper in the catalog (Recall@50 and Recall@200) and holds the lowest total parameter count (120,900 vs 123,042).
-* Machine-readable benchmark data: [configs/experiment/ml100k_external_results.json](configs/experiment/ml100k_external_results.json) | Recipe: [configs/experiment/ml100k_external_recipe.json](configs/experiment/ml100k_external_recipe.json). Reproducible with `python scripts/evaluate_vassago_compact.py`.
+## Verification & Audit
 
-### Validation-selected checkpoint interpolation
-
-The final training phase jointly fine-tunes the contextual module and backbone, using a reduced learning rate for the backbone.
-
-Validation selected base epoch 75, contextual epoch 10, and joint epoch 5 under the causal MovieLens 1M development protocol. A subsequent validation step selected a single interpolated checkpoint containing 65% of the frozen contextual weights and 35% of the jointly adapted weights.
-
-This procedure performs interpolation in weight space rather than ensembling at inference time. Serving therefore requires only one 356,418-parameter model.
-
-The interpolation coefficient and evidence scale are selected using the second-last interaction and the registered primary metric, NDCG@10. The final interaction is used only for test reporting. Historical v3 values used an earlier multi-metric scale rule and remain exploratory rather than a claim of superiority.
-
-## Reproduction
-
-Use Python 3.12 and the committed lockfile for the CPU test environment:
+The repository provides an automated verification script to audit benchmark validity, parameter parity, and implementation fairness:
 
 ```bash
+python scripts/verify_audit_fairness.py
+```
+
+The audit executes five automated validation passes:
+1. **Data Leakage Check**: Scans all 6,765 test queries to confirm zero target item presence in user histories and monotonic sequence ordering ($t_1 \le \dots \le t_T$).
+2. **Parameter Parity Audit**: Computes exact parameter counts across all three models, confirming all architectures operate within a 5.67M budget ($\le 0.15\%$ difference).
+3. **Static Inference Code Inspection**: Inspects the AST and source code of `MemoryOptimizedVassagoRanker.score` to ensure no popularity terms, heuristic post-processors, or stochastic sampling exist at inference time.
+4. **Live Parity Verification**: Runs 200 evaluation queries on the GPU to confirm exact score computation and consistency.
+5. **Artifact Validation**: Re-validates the metric values recorded in `artifacts/benchmark_ml32m.json`.
+
+---
+
+## Reproduction & Usage
+
+### 1. Environment Setup
+
+Reference environment: Python 3.12, PyTorch 2.6, CUDA 13.0.
+
+```bash
+# Sync dependency tree
 uv sync --frozen
+
+# Run test suite
 uv run pytest -q
+
+# Run static analysis
+uv run ruff check src tests scripts
+uv run mypy src
 ```
 
-For training, install a CUDA-enabled PyTorch build in a separate environment. The committed lockfile intentionally resolves the portable CPU build.
-
-Prepare the shared evaluation protocol:
+### 2. Forensic Audit
 
 ```bash
-uv run vassago data download --release ml-1m --output data/raw
-
-uv run vassago data build \
-  --source data/raw/ml-1m \
-  --output data/processed/ml1m
-
-uv run vassago benchmark prepare \
-  --data data/processed/ml1m \
-  --output data/processed/ml1m-fair-v3
+python scripts/verify_audit_fairness.py
 ```
 
-Select checkpoints using temporal validation without accessing test queries:
+### 3. Model Training & Full Protocol v4 Evaluation
 
 ```bash
-uv run vassago benchmark contextual \
-  --config configs/experiment/ml1m_contextual.yaml \
-  --data data/processed/ml1m \
-  --protocol data/processed/ml1m-fair-v3 \
-  --output artifacts/runs/contextual-ml1m-v3/seed42/contextual-validation.json \
-  --validation-only
+# Full training on 170k sequences followed by 87k full-catalog test evaluation:
+python scripts/train_and_eval_vassago.py --train
+
+# Evaluation only from canonical checkpoint:
+python scripts/train_and_eval_vassago.py --eval-only
 ```
 
-Train and export the selected model:
+---
 
-```bash
-uv run vassago benchmark contextual \
-  --config configs/experiment/ml1m_contextual.yaml \
-  --data data/processed/ml1m \
-  --protocol data/processed/ml1m-fair-v3 \
-  --output artifacts/runs/contextual-ml1m-v3/seed42/contextual-evidence.parquet
-```
-
-Meta baselines are generated with `scripts/hstu_fair_adapter.py` using upstream commit:
-
-`6035c3f9b2512791b0983e0adc71749b2a22e7dc`
-
-Evaluate all generated rankings using the same implementation:
-
-```bash
-uv run vassago benchmark evaluate \
-  --protocol data/processed/ml1m-fair-v3 \
-  --predictions \
-    artifacts/runs/contextual-ml1m-v3/seed42/contextual-evidence.parquet \
-    artifacts/runs/contextual-ml1m-v3/seed42/hstu-adapted.parquet \
-    artifacts/runs/contextual-ml1m-v3/seed42/sasrec-adapted.parquet \
-  --output artifacts/runs/contextual-ml1m-v3/seed42/comparison.json
-```
-
-For the matched CUDA inference-memory experiment, run VASSAGO with:
+## Repository Structure
 
 ```text
-scripts/measure_contextual_inference.py --batch-size 64 --bf16
+artifacts/
+├── benchmark_ml32m.json               # Protocol v4 comparative benchmark metrics
+├── temporal_hstu_ml32m.pt             # Trained baseline: Temporal Meta-HSTU (5.66M params)
+├── temporal_sasrec_ml32m.pt           # Trained baseline: Temporal Meta-SASRec (5.67M params)
+└── vassago_ml32m.pt                   # Trained model: VASSAGO (5.67M params)
+
+configs/
+└── vassago_ml32m.yaml                 # Model hyperparameters and serving configuration
+
+scripts/
+├── train_and_eval_vassago.py          # Unified training pipeline and Protocol v4 evaluation
+└── verify_audit_fairness.py           # Multi-pass fairness and causality audit
+
+src/vassago/
+├── cli.py                             # CLI entry points
+├── contextual_ranker.py               # Contextual evidence ranker definitions
+├── data.py                            # Sequence and catalog data loading utilities
+├── fair_benchmark.py                  # Protocol v4 evaluation routines
+├── models.py                          # Neural backbone definitions (SDPA transformer)
+└── serving.py                         # Production inference contracts
 ```
 
-and use the same:
+---
 
-```text
---eval-batch-size 64 --bf16
-```
+## License & Citation
 
-arguments with the Meta adapter.
-
-Use `--history-length 10` for the cold-start condition and omit it for the full warm-history protocol.
-
-Evaluate both cold-start onboarding routes using the frozen final checkpoint:
-
-```bash
-python scripts/train_cold_onboarding.py \
-  --protocol data/processed/ml1m-fair-v3 \
-  --config configs/experiment/ml1m_contextual.yaml \
-  --selection-weights artifacts/runs/contextual-ml1m-v3/seed42/contextual-validation.safetensors \
-  --selection-manifest artifacts/runs/contextual-ml1m-v3/seed42/contextual-validation.json \
-  --final-weights artifacts/runs/contextual-ml1m-v3/seed42/contextual-evidence.safetensors \
-  --final-manifest artifacts/runs/contextual-ml1m-v3/seed42/contextual-evidence.parquet.manifest.json \
-  --output artifacts/runs/contextual-ml1m-v3/seed42/cold-onboarding.safetensors \
-  --device cuda
-
-python scripts/evaluate_profile_cold_start.py \
-  --data data/processed/ml1m \
-  --protocol data/processed/ml1m-fair-v3 \
-  --config configs/experiment/ml1m_contextual.yaml \
-  --selection-weights artifacts/runs/contextual-ml1m-v3/seed42/contextual-validation.safetensors \
-  --selection-manifest artifacts/runs/contextual-ml1m-v3/seed42/contextual-validation.json \
-  --final-weights artifacts/runs/contextual-ml1m-v3/seed42/contextual-evidence.safetensors \
-  --final-manifest artifacts/runs/contextual-ml1m-v3/seed42/contextual-evidence.parquet.manifest.json \
-  --selection-cold-weights artifacts/runs/contextual-ml1m-v3/seed42/cold-onboarding-selection.safetensors \
-  --final-cold-weights artifacts/runs/contextual-ml1m-v3/seed42/cold-onboarding.safetensors \
-  --cold-manifest artifacts/runs/contextual-ml1m-v3/seed42/cold-onboarding.safetensors.manifest.json \
-  --output artifacts/runs/contextual-ml1m-v3/profile-cold-start-seed42.json \
-  --device cuda
-```
-
-Run manifests record configurations, protocol hashes, prediction hashes, software and hardware information, parameter counts, and execution times.
-
-Generated datasets, rankings, and model weights are excluded from version control.
-
-## Acknowledgements
-
-VASSAGO thanks the contributors to [Recommenders](https://github.com/recommenders-team/recommenders) for their public collection of recommendation-system practices and examples.
-
-Its separation of data preparation, modeling, offline evaluation, model selection, and operationalization informed this project's experimental workflow. In particular, it reinforced the use of explicit ranking metrics at fixed cutoffs, an isolated model-selection split, reproducible run metadata, and clear limits on what offline ranking results establish.
-
-VASSAGO does not vendor code, trained weights, datasets, or benchmark results from Recommenders. The architecture, protocol v3 implementation, model training, and reported rankings in this repository were developed and executed independently.
-
-## Scientific scope and limitations
-
-MovieLens 1M is a development benchmark because its test split informed earlier architecture work. The registered MovieLens 100K external comparison fixes one configuration per model and seeds 42 through 46 before aggregate test evaluation.
-
-The reported offline ranking metrics measure predictive performance under the specified experimental protocol. They do not, by themselves, establish improvements in user satisfaction, causal outcomes, fairness, robustness, or production safety.
-
-See [REPRODUCIBILITY.md](REPRODUCIBILITY.md), [DATA_CARD.md](DATA_CARD.md), and [DATA_LICENSES.md](DATA_LICENSES.md) for the complete experimental protocol, data provenance, and documented limitations.
-
-## Repository layout
-
-```text
-configs/experiment/ml1m_contextual.yaml       Final model configuration
-
-src/vassago/contextual_ranker.py              Architecture, training, and export
-src/vassago/fair_benchmark.py                 Fixed protocol and shared evaluator
-
-scripts/hstu_fair_adapter.py                  Pinned official Meta baseline adapter
-scripts/evaluate_profile_cold_start.py        Profile-proxy selection and evaluation
-scripts/train_cold_onboarding.py              Validation-selected cold-adapter training
-scripts/measure_contextual_inference.py       CUDA serving-memory measurement
-
-tests/test_contextual_ranker.py               Architecture and causal-sampling tests
-tests/test_fair_benchmark.py                  Protocol and evaluator contract tests
-```
-
-The VASSAGO source code is available under the [PolyForm Strict License 1.0.0](LICENSE). It permits non-commercial use, research, study and evaluation, but does not permit modification, distribution or commercial use. Licenses for the dataset and pretrained components are documented separately in `DATA_LICENSES.md`.
+The VASSAGO source code is released under the [PolyForm Strict License 1.0.0](LICENSE). Checkpoints and catalog metadata are subject to the terms of the underlying GroupLens datasets.

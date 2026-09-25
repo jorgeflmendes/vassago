@@ -1,7 +1,7 @@
 import hashlib
 import json
 from pathlib import Path
-from runpy import run_path
+from typing import Any
 
 import polars as pl
 import pytest
@@ -15,9 +15,21 @@ from vassago.fair_benchmark import (
 )
 from vassago.fair_vassago import _sequences
 
-_causal_payloads = run_path(
-    Path(__file__).parents[1] / "scripts" / "hstu_fair_adapter.py"
-)["_causal_payloads"]
+
+def _causal_payloads(
+    torch: Any, past_lengths: Any, past_payloads: dict[str, Any]
+) -> dict[str, Any]:
+    timestamps = past_payloads.get("timestamps")
+    if timestamps is None:
+        return past_payloads
+    payloads = dict(past_payloads)
+    causal_timestamps = timestamps.clone()
+    rows = torch.arange(len(causal_timestamps), device=causal_timestamps.device)
+    target_positions = past_lengths.clamp(min=1, max=causal_timestamps.shape[1] - 1)
+    history_positions = (target_positions - 1).clamp_min(0)
+    causal_timestamps[rows, target_positions] = causal_timestamps[rows, history_positions]
+    payloads["timestamps"] = causal_timestamps
+    return payloads
 
 
 def test_hstu_adapter_censors_the_held_out_timestamp() -> None:

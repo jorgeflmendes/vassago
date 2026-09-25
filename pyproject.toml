@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "vassago-rank"
 version = "0.1.0"
-description = "VASSAGO temporal candidate-conditioned evidence ranker for sequential recommendation"
+description = "VASSAGO: Variable-decay Attention with Short-span State Attribution for Global-catalog Ordering"
 authors = [
     { name = "Jorge Mendes" },
 ]

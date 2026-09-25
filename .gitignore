@@ -12,12 +12,10 @@ data/raw/
 data/interim/
 data/processed/
 data/reports/
-artifacts/
-reports/runs/
-reports/figures/
-reports/tables/
 *.log
 *.pt
+!artifacts/*.pt
+!artifacts/*.json
 *.safetensors
 *.npy
 *.parquet

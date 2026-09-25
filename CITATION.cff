@@ -1,6 +1,6 @@
 cff-version: 1.2.0
 message: Cite the software version and commit used; there is no published VASSAGO paper.
-title: 'VASSAGO: Temporal Candidate-Conditioned Evidence for Sequential Recommendation'
+title: 'VASSAGO: Variable-decay Attention with Short-span State Attribution for Global-catalog Ordering'
 type: software
 authors:
   - given-names: Jorge
