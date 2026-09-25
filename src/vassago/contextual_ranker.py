@@ -46,9 +46,7 @@ class FixedSelectionRecipe(BaseModel):
 
 
 def _config_fingerprint(config: ExperimentConfig) -> str:
-    payload = json.dumps(
-        config.model_dump(exclude={"seed"}), sort_keys=True, separators=(",", ":")
-    )
+    payload = json.dumps(config.model_dump(exclude={"seed"}), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
@@ -58,9 +56,8 @@ def _read_selection_recipe(
     recipe = FixedSelectionRecipe.model_validate_json(path.read_text(encoding="utf-8"))
     if recipe.source_protocol_hash == target_protocol_hash:
         raise ValueError("Selection recipe must originate from a separate development protocol")
-    if (
-        recipe.config_fingerprint is not None
-        and recipe.config_fingerprint != _config_fingerprint(config)
+    if recipe.config_fingerprint is not None and recipe.config_fingerprint != _config_fingerprint(
+        config
     ):
         raise ValueError("Selection recipe does not match the configured architecture")
     return recipe
@@ -243,9 +240,7 @@ class ContextualBackbone(SASRec):
         for layer in self.encoder.layers:
             source = result
             normalised = layer.norm1(source)
-            query_weight, key_weight, value_weight = layer.self_attn.in_proj_weight.split(
-                dimension
-            )
+            query_weight, key_weight, value_weight = layer.self_attn.in_proj_weight.split(dimension)
             query_bias, key_bias, value_bias = layer.self_attn.in_proj_bias.split(dimension)
             key = F.linear(normalised, key_weight, key_bias).reshape(
                 batch_size, sequence_length, heads, head_dimension
@@ -258,13 +253,11 @@ class ContextualBackbone(SASRec):
             updated = torch.empty_like(source)
             for start in range(0, sequence_length, chunk_size):
                 end = min(start + chunk_size, sequence_length)
-                query = F.linear(
-                    normalised[:, start:end], query_weight, query_bias
-                ).reshape(batch_size, end - start, heads, head_dimension)
+                query = F.linear(normalised[:, start:end], query_weight, query_bias).reshape(
+                    batch_size, end - start, heads, head_dimension
+                )
                 query = query.transpose(1, 2)
-                logits = torch.matmul(
-                    query, key.transpose(-2, -1)
-                ) / head_dimension**0.5
+                logits = torch.matmul(query, key.transpose(-2, -1)) / head_dimension**0.5
                 if timestamps is not None:
                     assert query_times is not None
                     elapsed = query_times[:, start:end, None] - timestamps[:, None, :]
@@ -336,9 +329,7 @@ class ContextualEvidenceRanker(nn.Module):
             )
             increments = start - float(np.log(60 * 60))
             increments[1:] = start[1:] - start[:-1]
-            self.persistence_half_life_increments = nn.Parameter(
-                torch.log(torch.expm1(increments))
-            )
+            self.persistence_half_life_increments = nn.Parameter(torch.log(torch.expm1(increments)))
             self.persistence_gamma_unconstrained = nn.Parameter(torch.tensor(-4.0))
             self.persistence_disagreement_unconstrained = nn.Parameter(torch.tensor(-2.0))
         self.velocity_scales = velocity_scales
@@ -433,9 +424,9 @@ class ContextualEvidenceRanker(nn.Module):
             indices = indices.clamp_min(0)
             batch = torch.arange(len(states), device=states.device)[:, None]
             memory_times = timestamps[batch, indices]
-            query_times = timestamps[
-                torch.arange(len(states), device=states.device), positions
-            ][:, None]
+            query_times = timestamps[torch.arange(len(states), device=states.device), positions][
+                :, None
+            ]
             ages = (query_times - memory_times).clamp_min(0).to(dtype=states.dtype)
         decay = torch.exp(-ages[:, :, None] / half_lives[None, None, :])
         weights = F.softmax(self.persistence_router(memory), dim=-1) * decay
@@ -773,9 +764,7 @@ def _validation_cutoff_metrics(
     for cutoff in (10, 50, 200):
         hits = rank_array <= cutoff
         result[f"Recall@{cutoff}"] = float(hits.mean())
-        result[f"NDCG@{cutoff}"] = float(
-            np.where(hits, 1 / np.log2(rank_array + 1), 0).mean()
-        )
+        result[f"NDCG@{cutoff}"] = float(np.where(hits, 1 / np.log2(rank_array + 1), 0).mean())
         result[f"MRR@{cutoff}"] = float(np.where(hits, 1 / rank_array, 0).mean())
     return result
 
@@ -789,9 +778,7 @@ def _select_evidence_scale(
     """Select the evidence scale by the registered primary validation metric."""
     candidates = (0.5, 0.75, 1.0, 1.25, 1.5, 2.0)
     evaluations = {
-        str(scale): _validation_cutoff_metrics(
-            model, examples, timestamp_histories, config, scale
-        )
+        str(scale): _validation_cutoff_metrics(model, examples, timestamp_histories, config, scale)
         for scale in candidates
     }
     selected = max(candidates, key=lambda scale: evaluations[str(scale)]["NDCG@10"])
@@ -808,10 +795,7 @@ def _apply_evidence_scale(model: ContextualEvidenceRanker, scale: float) -> None
 
 
 def _cpu_state(model: nn.Module) -> dict[str, Tensor]:
-    return {
-        name: value.detach().cpu().clone()
-        for name, value in model.state_dict().items()
-    }
+    return {name: value.detach().cpu().clone() for name, value in model.state_dict().items()}
 
 
 def _interpolate_state(
@@ -843,17 +827,13 @@ def _select_weight_soup(
         )
     metrics = tuple(evaluations["1.0"])
     endpoint_best = {
-        metric: max(evaluations["0.0"][metric], evaluations["1.0"][metric])
-        for metric in metrics
+        metric: max(evaluations["0.0"][metric], evaluations["1.0"][metric]) for metric in metrics
     }
     selected = max(
         candidates,
         key=lambda weight: (
             sum(evaluations[str(weight)][metric] / endpoint_best[metric] for metric in metrics),
-            min(
-                evaluations[str(weight)][metric] / endpoint_best[metric] - 1
-                for metric in metrics
-            ),
+            min(evaluations[str(weight)][metric] / endpoint_best[metric] - 1 for metric in metrics),
         ),
     )
     model.load_state_dict(_interpolate_state(original, adapted, selected))

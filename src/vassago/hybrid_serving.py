@@ -110,9 +110,7 @@ class CollaborativeProfileProjector:
                 features[row, self.feature_index[token]] = 1
         if vocabulary:
             document_frequency = (features > 0).sum(axis=0)
-            self.idf = (np.log((1 + len(movies)) / (1 + document_frequency)) + 1).astype(
-                np.float32
-            )
+            self.idf = (np.log((1 + len(movies)) / (1 + document_frequency)) + 1).astype(np.float32)
             weighted = features * self.idf
             self.normalised_features = weighted / np.linalg.norm(
                 weighted, axis=1, keepdims=True
@@ -126,9 +124,9 @@ class CollaborativeProfileProjector:
             self.idf = np.zeros(0, dtype=np.float32)
             self.normalised_features = features
             self.projection = np.zeros((0, vectors.shape[1]), dtype=np.float32)
-        self.item_vectors = vectors[1:] / np.linalg.norm(
-            vectors[1:], axis=1, keepdims=True
-        ).clip(1e-12)
+        self.item_vectors = vectors[1:] / np.linalg.norm(vectors[1:], axis=1, keepdims=True).clip(
+            1e-12
+        )
         scaled = np.log1p(popularity[1:])
         self.popularity = scaled / max(float(scaled.max()), 1.0)
 
@@ -141,9 +139,7 @@ class CollaborativeProfileProjector:
             "language": profile.languages,
         }
         return {
-            f"{prefix}:{_normalise(value)}"
-            for prefix, values in fields.items()
-            for value in values
+            f"{prefix}:{_normalise(value)}" for prefix, values in fields.items() for value in values
         }
 
     def preference_score(
@@ -184,9 +180,8 @@ class CollaborativeProfileProjector:
         if not known and not (profile is not None and profile.years is not None):
             return self.popularity.copy(), matches
         scores = (
-            (1 - self.popularity_weight) * preference
-            + self.popularity_weight * self.popularity
-        )
+            1 - self.popularity_weight
+        ) * preference + self.popularity_weight * self.popularity
         return scores.astype(np.float32, copy=False), matches
 
 
@@ -265,9 +260,7 @@ class ParetoHybridRecommender:
                 config.contextual_persistence_scales,
                 config.contextual_velocity_scales,
             ).to(device)
-            cold_model.load_state_dict(
-                load_file(cold_weights_path, device=device), strict=True
-            )
+            cold_model.load_state_dict(load_file(cold_weights_path, device=device), strict=True)
         return cls(
             model,
             config,
@@ -292,10 +285,7 @@ class ParetoHybridRecommender:
             raise ValueError("History must strictly precede recommendation timestamp")
         if any(event.movie_id > len(self.movies) for event in history):
             raise ValueError("History contains unknown movies")
-        if any(
-            event.timestamp < self.movies[event.movie_id - 1].available_at
-            for event in history
-        ):
+        if any(event.timestamp < self.movies[event.movie_id - 1].available_at for event in history):
             raise ValueError("History contains an interaction before movie availability")
         if len({event.user_id for event in history}) > 1:
             raise ValueError("A recommendation history must belong to one user")
@@ -328,24 +318,18 @@ class ParetoHybridRecommender:
         if not positive and favorites:
             cold_favorites = favorites[-self.config.max_length :]
             sequence_length = max(len(cold_favorites), 1)
-            ids = torch.zeros(
-                1, sequence_length, dtype=torch.long, device=self.device
-            )
+            ids = torch.zeros(1, sequence_length, dtype=torch.long, device=self.device)
             ids[0, : len(cold_favorites)] = torch.tensor(cold_favorites, device=self.device)
             _, contextual = self.cold_model.score(
                 ids, inference_chunk_size=self.inference_attention_chunk_size
             )
             item_vectors = self.cold_model.backbone.item_vectors()
-            favorite_vectors = item_vectors[
-                torch.tensor(cold_favorites[-3:], device=self.device)
-            ]
-            centroid = torch.nn.functional.normalize(
-                favorite_vectors.mean(0), dim=0
-            ) @ item_vectors.T
+            favorite_vectors = item_vectors[torch.tensor(cold_favorites[-3:], device=self.device)]
+            centroid = (
+                torch.nn.functional.normalize(favorite_vectors.mean(0), dim=0) @ item_vectors.T
+            )
             weight = self.onboarding_centroid_weight
-            scores = (
-                (1 - weight) * contextual[0] + weight * centroid
-            ).detach().cpu().numpy()
+            scores = ((1 - weight) * contextual[0] + weight * centroid).detach().cpu().numpy()
             allowed_ids = np.flatnonzero(np.concatenate(([False], eligible)))
             order = allowed_ids[np.argsort(-scores[allowed_ids], kind="stable")[:k]]
             return [

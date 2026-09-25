@@ -60,26 +60,20 @@ def test_warm_scores_are_invariant_to_profile() -> None:
         UserPreferenceProfile(genres=["Drama"], favorite_movie_ids=[3, 4]),
         context,
     )
-    second = recommender.recommend(
-        history, 12, UserPreferenceProfile(genres=["Comedy"]), context
-    )
+    second = recommender.recommend(history, 12, UserPreferenceProfile(genres=["Comedy"]), context)
     assert [row.movie_id for row in first] == [row.movie_id for row in second]
     assert [row.score for row in first] == [row.score for row in second]
     assert all(row.source == "contextual" for row in first)
     ids = torch.tensor([[2, 6]])
     timestamps = torch.tensor([[100, 200]])
-    query_timestamps = _query_timestamp_tensor(
-        timestamps, torch.tensor([2]), torch.tensor([300])
-    )
+    query_timestamps = _query_timestamp_tensor(timestamps, torch.tensor([2]), torch.tensor([300]))
     _, expected = recommender.model.score(
         ids,
         timestamps=timestamps,
         query_timestamps=query_timestamps,
         inference_chunk_size=recommender.inference_attention_chunk_size,
     )
-    assert [row.score for row in first] == [
-        float(expected[0, row.movie_id]) for row in first
-    ]
+    assert [row.score for row in first] == [float(expected[0, row.movie_id]) for row in first]
 
 
 def test_onboarding_favorites_use_contextual_checkpoint() -> None:
@@ -113,9 +107,9 @@ def test_onboarding_can_use_a_separate_cold_adapter() -> None:
         RecommendationContext(timestamp=10_000),
     )
     ids = torch.tensor([[1, 5, 9]])
-    expected = cold.score(
-        ids, inference_chunk_size=recommender.inference_attention_chunk_size
-    )[1][0]
+    expected = cold.score(ids, inference_chunk_size=recommender.inference_attention_chunk_size)[1][
+        0
+    ]
     assert [row.score for row in rows] == [float(expected[row.movie_id]) for row in rows]
 
 

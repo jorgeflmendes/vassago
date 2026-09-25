@@ -57,9 +57,12 @@ def test_fixed_selection_recipe_requires_a_separate_development_protocol(tmp_pat
 """
     )
     assert _read_selection_recipe(recipe_path, "b" * 64, config).selected_base_epoch == 2
-    assert _read_selection_recipe(
-        recipe_path, "b" * 64, config.model_copy(update={"seed": 43})
-    ).selected_base_epoch == 2
+    assert (
+        _read_selection_recipe(
+            recipe_path, "b" * 64, config.model_copy(update={"seed": 43})
+        ).selected_base_epoch
+        == 2
+    )
     with pytest.raises(ValueError, match="separate development"):
         _read_selection_recipe(recipe_path, "a" * 64, config)
     with pytest.raises(ValueError, match="configured architecture"):
@@ -106,6 +109,7 @@ def test_sampled_scores_match_catalog_scores_for_last_position() -> None:
     assert not full_base.requires_grad
     assert not full_contextual.requires_grad
 
+
 def test_contextual_loss_reaches_memory_and_candidate_projections() -> None:
     model = _model().train()
     history = torch.tensor([[1, 2, 3, 0, 0, 0]])
@@ -121,6 +125,7 @@ def test_contextual_loss_reaches_memory_and_candidate_projections() -> None:
     ):
         assert parameter.grad is not None
         assert torch.isfinite(parameter.grad).all()
+
 
 def test_temporal_partition_bounds_contain_exact_evidence() -> None:
     model = _model().eval()
@@ -272,9 +277,7 @@ def test_evidence_scale_selection_uses_registered_ndcg10(monkeypatch: pytest.Mon
     def fake_metrics(*_args: Any, **_kwargs: Any) -> dict[str, float]:
         scale = float(_args[-1])
         return {
-            "NDCG@10": {0.5: 0.2, 0.75: 0.3, 1.0: 0.25, 1.25: 0.1, 1.5: 0.1, 2.0: 0.1}[
-                scale
-            ],
+            "NDCG@10": {0.5: 0.2, 0.75: 0.3, 1.0: 0.25, 1.25: 0.1, 1.5: 0.1, 2.0: 0.1}[scale],
             "Recall@50": float(scale),
         }
 
@@ -385,9 +388,7 @@ def test_chunked_inference_preserves_temporal_catalog_ranking() -> None:
     query_timestamps = _query_timestamp_tensor(
         timestamps, torch.tensor([3, 2]), torch.tensor([400, 200])
     )
-    _, standard = model.score(
-        history, timestamps=timestamps, query_timestamps=query_timestamps
-    )
+    _, standard = model.score(history, timestamps=timestamps, query_timestamps=query_timestamps)
     _, chunked = model.score(
         history,
         timestamps=timestamps,

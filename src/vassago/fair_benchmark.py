@@ -114,9 +114,7 @@ def prepare_protocol(
         "movielens-1m": ("MovieLens-1M", "ml-1m-leave-one-out-v3"),
         "movielens-100k": ("MovieLens-100K", "ml-100k-leave-one-out-v3"),
     }
-    dataset_name, protocol_name = dataset_names.get(
-        source, (source, f"{source}-leave-one-out-v3")
-    )
+    dataset_name, protocol_name = dataset_names.get(source, (source, f"{source}-leave-one-out-v3"))
     minimum_id = int(interactions["movie_id"].min() or 0)  # type: ignore[arg-type]
     maximum_id = int(interactions["movie_id"].max() or 0)  # type: ignore[arg-type]
     if minimum_id < 1 or maximum_id > item_count:
@@ -150,9 +148,7 @@ def prepare_protocol(
                 training_sequence_rows.append(
                     {
                         "user_id": ordered[0]["user_id"],
-                        "sequence_item_ids": ",".join(
-                            str(row["movie_id"]) for row in history_rows
-                        ),
+                        "sequence_item_ids": ",".join(str(row["movie_id"]) for row in history_rows),
                         "sequence_ratings": ",".join(
                             str(int(row["rating"])) for row in history_rows
                         ),
@@ -437,9 +433,7 @@ def evaluate_predictions(protocol_directory: Path, predictions: list[Path], outp
         )
     seed_summary = []
     metric_names = sorted(
-        key
-        for key, value in metrics[0].items()
-        if "@" in key and isinstance(value, (int, float))
+        key for key, value in metrics[0].items() if "@" in key and isinstance(value, (int, float))
     )
     for model in sorted({row["model"] for row in metrics}):
         model_runs = [row for row in metrics if row["model"] == model]
@@ -499,8 +493,8 @@ def popularity_predictions(data: Path, protocol_directory: Path, seed: int, outp
         counts = pl.read_parquet(training_interactions).group_by("movie_id").len()
     else:
         interactions = pl.read_parquet(data / "interactions.parquet")
-        held_out = queries.group_by("target").len().rename(
-            {"target": "movie_id", "len": "held_out"}
+        held_out = (
+            queries.group_by("target").len().rename({"target": "movie_id", "len": "held_out"})
         )
         counts = (
             interactions.group_by("movie_id")

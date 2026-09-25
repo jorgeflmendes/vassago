@@ -126,9 +126,7 @@ def test_ml1m_protocol_and_strict_shared_evaluator(tmp_path: Path) -> None:
     adapter_report = evaluate_predictions(protocol_dir, [a, adapter_csv], tmp_path / "adapter.json")
     assert json.loads(adapter_report.read_text())["metrics"][1]["model"] == "b"
 
-    invalid = predictions(
-        "invalid", [[4, 7, 8], [8, 1, 2]], tmp_path / "invalid.parquet"
-    )
+    invalid = predictions("invalid", [[4, 7, 8], [8, 1, 2]], tmp_path / "invalid.parquet")
     with pytest.raises(ValueError, match="already present"):
         evaluate_predictions(protocol_dir, [a, invalid], tmp_path / "invalid.json")
 
