@@ -16,6 +16,7 @@ data/reports/
 *.pt
 !artifacts/*.pt
 !artifacts/*.json
+!artifacts/*.onnx
 *.safetensors
 *.npy
 *.parquet
