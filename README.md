@@ -85,30 +85,54 @@ flowchart TD
 ### Mathematical Formulation
 
 #### 1. Continuous Parametric Temporal Decay
+
 For positions $i, j \le T$ with timestamps $t_i, t_j$ ($\Delta t_{i,j} = |t_i - t_j|$), the temporal bias for attention head $h$ is:
 
-$$\text{Bias}_{i,j}^{(h)} = -\gamma_h \cdot \ln\left(1 + \frac{\Delta t_{i,j}}{\tau}\right), \quad \gamma_h = \exp(\theta_h)$$
+$$
+\text{Bias}_{i,j}^{(h)} = -\gamma_h \cdot \ln\left(1 + \frac{\Delta t_{i,j}}{\tau}\right), \quad \gamma_h = \exp(\theta_h)
+$$
 
 where $\theta_h$ is a learnable per-head parameter and $\tau = 86{,}400\text{ s}$ (1 day). Attention weights are computed via native scaled dot-product attention:
 
-$$\mathbf{A}^{(h)} = \text{softmax}\left(\frac{\mathbf{Q}^{(h)} (\mathbf{K}^{(h)})^T}{\sqrt{d_h}} + \text{Bias}^{(h)} + \mathbf{M}_{\text{causal}}\right)$$
+$$
+\mathbf{A}^{(h)} = \text{softmax}\left(\frac{\mathbf{Q}^{(h)} (\mathbf{K}^{(h)})^T}{\sqrt{d_h}} + \text{Bias}^{(h)} + \mathbf{M}_{\text{causal}}\right)
+$$
 
 #### 2. Candidate-Conditioned Contextual Evidence
-From the sequence representations $\mathbf{H} \in \mathbb{R}^{T \times d}$, we extract the terminal state $\mathbf{h}_T \in \mathbb{R}^d$ and the memory window $\mathbf{M} = \mathbf{H}_{T-M:T, :} \in \mathbb{R}^{M \times d}$ ($M=8$).
+
+From the sequence representations $\mathbf{H} \in \mathbb{R}^{T \times d}$, we extract the terminal state $\mathbf{h}_T \in \mathbb{R}^d$ and the memory window $\mathbf{M} = \mathbf{H}_{T-M:T, :} \in \mathbb{R}^{M \times d}$ with $M=8$.
 
 For each candidate item embedding $\mathbf{e}_i \in \mathbb{R}^d$:
-1. **Base dot product**:
-   $$s_{\text{base}}(i) = \langle \mathbf{h}_T, \mathbf{e}_i \rangle$$
-2. **Contextual attention**:
-   $$\mathbf{a}_i = \text{softmax}\left(\frac{(\mathbf{M} \mathbf{W}_m) (\mathbf{e}_i \mathbf{W}_c)^T}{\sqrt{\tau_{\text{ctx}}}}\right) \in \mathbb{R}^M$$
-   $$\Delta s_{\text{ctx}}(i) = \mathbf{W}_{\text{ev}} \left(\sum_{m=1}^M a_{i,m} (\mathbf{M}_m \mathbf{W}_m)\right)$$
-3. **Fused score**:
-   $$s_{\text{final}}(i) = s_{\text{base}}(i) + \beta \cdot \Delta s_{\text{ctx}}(i), \quad \beta = 0.50$$
+
+**Base Bilinear Score:**
+
+$$
+s_{\text{base}}(i) = \langle \mathbf{h}_T, \mathbf{e}_i \rangle
+$$
+
+**Contextual Cross-Attention:**
+
+$$
+\mathbf{a}_i = \text{softmax}\left(\frac{(\mathbf{M} \mathbf{W}_m) (\mathbf{e}_i \mathbf{W}_c)^T}{\sqrt{\tau_{\text{ctx}}}}\right) \in \mathbb{R}^M
+$$
+
+$$
+\Delta s_{\text{ctx}}(i) = \mathbf{W}_{\text{ev}} \left(\sum_{m=1}^M a_{i,m} (\mathbf{M}_m \mathbf{W}_m)\right)
+$$
+
+**Score Fusion:**
+
+$$
+s_{\text{final}}(i) = s_{\text{base}}(i) + \beta \cdot \Delta s_{\text{ctx}}(i), \quad \beta = 0.50
+$$
 
 #### 3. Training Objective with Inverse-Frequency Regularization
+
 Models are trained with cross-entropy over causal next-item prediction. To mitigate catalog popularity bias without post-hoc heuristics, training logits are regularized by the empirical item distribution $P(i)$:
 
-$$\mathcal{L} = -\sum_{k} \log \frac{\exp(s_{\text{final}}(y_k) + \alpha \log P(y_k))}{\sum_{j=1}^N \exp(s_{\text{final}}(j) + \alpha \log P(j))}, \quad \alpha = 0.25$$
+$$
+\mathcal{L} = -\sum_{k} \log \frac{\exp(s_{\text{final}}(y_k) + \alpha \log P(y_k))}{\sum_{j=1}^N \exp(s_{\text{final}}(j) + \alpha \log P(j))}, \quad \alpha = 0.25
+$$
 
 At test and serving time, $\alpha \log P(i)$ is omitted; candidate ranking is driven entirely by $s_{\text{final}}(i)$.
 
