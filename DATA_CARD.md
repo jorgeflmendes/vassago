@@ -27,9 +27,10 @@ Ratings range from 0.5 to 5.0. All source ratings and timestamps are preserved i
 
 ## Evaluation Boundaries and Integrity
 
-1. **Full-Catalog Scoring**:
-   - All models score all 87,585 items for each of the 6,765 queries.
-   - Negative candidate sampling is not used during test evaluation.
+1. **Full-Catalog Scoring & Strict Candidate Masking**:
+   - The global catalog contains 87,585 items. Under Protocol v4, scoring evaluates against the **50,977 candidate items** observed in training sequences prior to the global test cutoff (`candidate_item_ids`).
+   - The 36,608 catalog items never observed prior to the cutoff receive $-\infty$ logits to eliminate random uninitialized embedding noise.
+   - Negative candidate sampling is not used during test evaluation; all eligible candidate items are scored.
 
 2. **Pre-Query Seen-Item Filtering**:
    - All items previously interacted with in the sequence history receive $-\infty$ logits before top-$K$ selection.
@@ -47,6 +48,6 @@ Ratings range from 0.5 to 5.0. All source ratings and timestamps are preserved i
 
 1. **Protocol v4 Causal Boundary:** Offline query timestamps are strictly tied to interaction $T-1$, with the target at interaction $T$ withheld from model inputs. Cold-start interactions with sequence length $< 5$ are excluded from the test benchmark per protocol definition.
 2. **Deterministic Tie-Breaking:** Ties are broken strictly by ascending canonical `item_id`.
-3. **Hardware-Specific Serving Latencies:** Reported serving latencies (P95 of 2.99 ms) and peak VRAM (217.3 MB) are measured on an NVIDIA GeForce RTX 5080 with Tensor-Core candidate tiling (chunk size 8,192). Latency profiles will scale with GPU memory bandwidth and compute architecture.
+3. **Hardware-Specific Serving Latencies:** Reported serving latencies (P95 of 4.80 ms, throughput of 16,271 QPS) and peak VRAM (368.5 MB) are measured on an NVIDIA GeForce RTX 5080 with Tensor-Core candidate tiling (chunk size 8,192, bfloat16 precision). Latency profiles will scale with GPU memory bandwidth and compute architecture.
 
 Source data is derived from the public GroupLens MovieLens-32M release. Canonical model checkpoints are versioned under artifacts/.
