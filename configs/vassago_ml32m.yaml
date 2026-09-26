@@ -11,12 +11,11 @@ model:
   temporal_decay:
     type: parametric_continuous
     log_gamma_init: [-3.0, -2.3, -1.6, -0.7]
-    tau_minutes: 60.0
+    tau_seconds: 60.0  # 60.0 s (1.0 minute reference scale)
   contextual_head:
     memory_window: 8
     context_dimension: 32
     temperature: 0.1
-    evidence_heads: 1
     residual_scale_beta: 0.50
 
 training:
@@ -25,14 +24,16 @@ training:
   catalog_path: data/processed/ml32m-global-temporal-v4/catalog.json
   total_sequences: 170463
   catalog_items: 87585
-  batch_size: 256
+  batch_size: 512
   learning_rate: 0.001
   weight_decay: 0.0001
-  backbone_epochs: 25
-  context_epochs: 8
+  backbone_epochs: 35
+  context_epochs: 10
+  negatives_per_sequence: 256
+  logit_scale: 12.0
   debiasing:
     type: inverse_frequency_regularization
-    alpha: 0.25
+    alpha: 0.02
     scope: training_objective_only
     inference_adjustment: none
 

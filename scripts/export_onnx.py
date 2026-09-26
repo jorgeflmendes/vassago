@@ -69,7 +69,6 @@ def export_vassago_onnx(
         ctx_dim=32,
         mem_win=8,
         temp=0.1,
-        ctx_heads=1,
         ffn_dim=64,
     )
     state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)

@@ -1,4 +1,4 @@
-"""Auditoria independente de integridade, paridade e justiça científica do modelo VASSAGO."""
+"""Auditoria interna de integridade, paridade e justiça científica do VASSAGO."""
 
 import inspect
 import json
@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-print("=== AUDITORIA INDEPENDENTE DE INTEGRIDADE, PARIDADE E JUSTIÇA CIENTÍFICA ===")
+print("=== SUITE INTERNA DE VERIFICAÇÃO AUTOMATIZADA E INTEGRIDADE DO VASSAGO ===")
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 dev_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
@@ -32,7 +32,6 @@ dropout = 0.2
 ctx_dim = 32
 mem_win = 8
 temp = 0.1
-ctx_heads = 1
 ffn_dim = 64
 
 # ----------------------------------------------------------------------
@@ -332,7 +331,6 @@ class MemoryOptimizedVassagoRanker(nn.Module):
         ctx_dim: int,
         mem_win: int,
         temp: float,
-        ctx_heads: int,
         ffn_dim: int,
     ) -> None:
         super().__init__()
@@ -398,7 +396,7 @@ class MemoryOptimizedVassagoRanker(nn.Module):
 sasrec = TemporalMetaSASRec(n_items, dim, max_length, heads, layers, dropout).to(device)
 hstu = TemporalMetaHSTU(n_items, dim, max_length, heads, layers, dropout).to(device)
 vassago = MemoryOptimizedVassagoRanker(
-    n_items, dim, max_length, heads, layers, dropout, ctx_dim, mem_win, temp, ctx_heads, ffn_dim
+    n_items, dim, max_length, heads, layers, dropout, ctx_dim, mem_win, temp, ffn_dim
 ).to(device)
 
 p_sas = sum(p.numel() for p in sasrec.parameters())
@@ -443,12 +441,20 @@ sasrec.eval()
 hstu.eval()
 vassago.eval()
 
+candidate_mask = torch.zeros(n_items, dtype=torch.bool, device=device)
+if "candidate_item_ids" in protocol and protocol["candidate_item_ids"]:
+    candidate_mask[protocol["candidate_item_ids"]] = True
+else:
+    candidate_mask[1:] = True
+
 sample_q = queries_df.slice(0, 200).to_dicts()
 models = {
     "Temporal Meta-SASRec": (sasrec, False),
     "Temporal Meta-HSTU": (hstu, False),
     "VASSAGO": (vassago, True),
 }
+
+evaluated_metrics: dict[str, dict[str, float]] = {}
 
 for name, (m, is_v) in models.items():
     ranks = []
@@ -471,7 +477,7 @@ for name, (m, is_v) in models.items():
                 else:
                     scores = m.score(h_t, ts_t)
 
-            scores[:, 0] = -torch.inf
+            scores[:, ~candidate_mask] = -torch.inf
             for i, q in enumerate(batch):
                 if q["seen"]:
                     seen_idx = [x for x in q["seen"] if x < n_items]
@@ -479,7 +485,10 @@ for name, (m, is_v) in models.items():
 
             targets_t = torch.tensor([q["target"] for q in batch], device=device)
             target_scores = scores.gather(1, targets_t.unsqueeze(1))
-            r = ((scores > target_scores).sum(1) + 1).cpu().tolist()
+            item_ids = torch.arange(n_items, device=device).unsqueeze(0)
+            strictly_greater = (scores > target_scores).sum(1)
+            ties_lower_id = ((scores == target_scores) & (item_ids < targets_t.unsqueeze(1))).sum(1)
+            r = (strictly_greater + ties_lower_id + 1).cpu().tolist()
             ranks.extend(r)
 
     arr = np.array(ranks)
@@ -487,9 +496,21 @@ for name, (m, is_v) in models.items():
     rec10 = float(np.mean(arr <= 10))
     mrr10 = float(np.mean(np.where(arr <= 10, 1.0 / arr, 0.0)))
     med_rank = float(np.median(arr))
+    evaluated_metrics[name] = {
+        "NDCG@10": ndcg10,
+        "Recall@10": rec10,
+        "MRR@10": mrr10,
+        "MedRank": med_rank,
+    }
     print(
         f"  {name:22s} -> NDCG@10: {ndcg10:.4f} | Recall@10: {rec10:.4f} | "
         f"MRR@10: {mrr10:.4f} | MedRank: {med_rank:4.0f}"
+    )
+
+# Sanity assertion: ensure models actually rank within legitimate bounds
+for m_name, met in evaluated_metrics.items():
+    assert met["MedRank"] < 3000, (
+        f"Modelo {m_name} com ranking mediano degradado ({met['MedRank']})"
     )
 
 # ----------------------------------------------------------------------

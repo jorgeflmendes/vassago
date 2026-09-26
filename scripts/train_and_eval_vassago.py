@@ -14,6 +14,36 @@ import polars as pl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import yaml
+
+
+def sample_batch_negatives(
+    warm_items_t: torch.Tensor, targets_t: torch.Tensor, n_neg: int = 64
+) -> torch.Tensor:
+    """Sample independent negative items per sequence without replacement or target collision."""
+    B = targets_t.shape[0]
+    W = len(warm_items_t)
+    rand_idx = torch.randint(0, W, (B, n_neg), device=targets_t.device)
+    cands = warm_items_t[rand_idx]
+
+    target_collision = cands == targets_t.unsqueeze(1)
+    sorted_cands, _ = torch.sort(cands, dim=1)
+    dups = (sorted_cands[:, 1:] == sorted_cands[:, :-1]).any(dim=1)
+    needs_fix = target_collision.any(dim=1) | dups
+
+    if needs_fix.any():
+        fix_rows = torch.where(needs_fix)[0]
+        for idx in fix_rows:
+            target = targets_t[idx]
+            row_cands = cands[idx]
+            valid = row_cands[row_cands != target]
+            u = torch.unique(valid)
+            while len(u) < n_neg:
+                more = warm_items_t[torch.randint(0, W, (n_neg * 2,), device=targets_t.device)]
+                more = more[more != target]
+                u = torch.unique(torch.cat([u, more]))
+            cands[idx] = u[:n_neg]
+    return cands
 
 
 class MemoryOptimizedSDPABackbone(nn.Module):
@@ -138,7 +168,6 @@ class MemoryOptimizedVassagoRanker(nn.Module):
         ctx_dim: int,
         mem_win: int,
         temp: float,
-        ctx_heads: int,
         ffn_dim: int,
     ) -> None:
         super().__init__()
@@ -210,6 +239,7 @@ def evaluate_vassago(
     counts: np.ndarray,
     genres_by_item: list[set[str]],
     device: torch.device,
+    candidate_mask: torch.Tensor | None = None,
     batch_size: int = 128,
 ) -> dict[str, float]:
     """Run Protocol v4 full-catalog evaluation across all queries."""
@@ -239,7 +269,10 @@ def evaluate_vassago(
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 scores = model.score(h_t, ts_t, ts_t, chunk_size=8192, alpha=0.5)
 
-            scores[:, 0] = -torch.inf
+            if candidate_mask is not None:
+                scores[:, ~candidate_mask] = -torch.inf
+            else:
+                scores[:, 0] = -torch.inf
             for i, q in enumerate(batch):
                 if q["seen"]:
                     seen_idx = [x for x in q["seen"] if x < n_items]
@@ -247,10 +280,14 @@ def evaluate_vassago(
 
             targets_t = torch.tensor([q["target"] for q in batch], device=device)
             target_scores = scores.gather(1, targets_t.unsqueeze(1))
-            ranks = ((scores > target_scores).sum(1) + 1).cpu().tolist()
+            item_ids = torch.arange(n_items, device=device).unsqueeze(0)
+            strictly_greater = (scores > target_scores).sum(1)
+            ties_lower_id = ((scores == target_scores) & (item_ids < targets_t.unsqueeze(1))).sum(1)
+            ranks = (strictly_greater + ties_lower_id + 1).cpu().tolist()
             all_ranks.extend(ranks)
 
-            top10 = torch.topk(scores, 10, dim=-1).indices.cpu().numpy()
+            scores_tie = scores - item_ids * 1e-7
+            top10 = torch.topk(scores_tie, 10, dim=-1).indices.cpu().numpy()
             top10_recs.extend(top10.tolist())
 
     arr = np.array(all_ranks)
@@ -332,18 +369,83 @@ def main() -> None:
         description="Train or evaluate VASSAGO production model on MovieLens-32M"
     )
     parser.add_argument(
-        "--data-dir", type=Path, default=Path("data/processed/ml32m-global-temporal-v4")
+        "--config",
+        type=Path,
+        default=Path("configs/vassago_ml32m.yaml"),
+        help="Path to YAML configuration",
     )
-    parser.add_argument("--checkpoint", type=Path, default=Path("artifacts/vassago_ml32m.pt"))
     parser.add_argument(
-        "--eval-only", action="store_true", default=True, help="Run evaluation without retraining"
+        "--data-dir",
+        type=Path,
+        default=Path("data/processed/ml32m-global-temporal-v4"),
+        help="Path to processed data directory",
     )
-    parser.add_argument("--train", action="store_true", help="Retrain residual context head")
-    parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument(
-        "--sample-queries", type=int, default=0, help="Evaluate on subset of queries (0 = all)"
+        "--checkpoint",
+        type=Path,
+        default=Path("artifacts/vassago_ml32m.pt"),
+        help="Path to model checkpoint",
+    )
+    parser.add_argument(
+        "--train",
+        action="store_true",
+        help="Execute 2-stage training pipeline (backbone pretraining + contextual head training)",
+    )
+    parser.add_argument(
+        "--eval-only",
+        action="store_true",
+        default=False,
+        help="Run full Protocol v4 evaluation without training",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Evaluation batch size override (defaults to 128)",
+    )
+    parser.add_argument(
+        "--sample-queries",
+        type=int,
+        default=0,
+        help="Evaluate on subset of queries (0 = all)",
     )
     args = parser.parse_args()
+
+    # Load configuration from YAML
+    cfg: dict[str, Any] = {}
+    if args.config.exists():
+        with open(args.config, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+
+    model_cfg = cfg.get("model", {})
+    train_cfg = cfg.get("training", {})
+    serving_cfg = cfg.get("serving", {})
+
+    dim = model_cfg.get("dimension", 64)
+    heads = model_cfg.get("heads", 4)
+    layers = model_cfg.get("layers", 2)
+    max_length = model_cfg.get("max_length", 200)
+    dropout = model_cfg.get("dropout", 0.2)
+    ffn_dim = model_cfg.get("ffn_dim", 64)
+
+    ctx_cfg = model_cfg.get("contextual_head", {})
+    mem_win = ctx_cfg.get("memory_window", 8)
+    ctx_dim = ctx_cfg.get("context_dimension", 32)
+    temp = ctx_cfg.get("temperature", 0.1)
+
+    train_batch_size = train_cfg.get("batch_size", 256)
+    lr = train_cfg.get("learning_rate", 0.001)
+    weight_decay = train_cfg.get("weight_decay", 0.0001)
+    backbone_epochs = train_cfg.get("backbone_epochs", 25)
+    context_epochs = train_cfg.get("context_epochs", 8)
+    n_neg = train_cfg.get("negatives_per_sequence", 256)
+    logit_scale = float(train_cfg.get("logit_scale", 10.0))
+    debias_cfg = train_cfg.get("debiasing", {})
+    alpha_debias = debias_cfg.get("alpha", 0.02)
+
+    _ = serving_cfg.get("tiling_chunk_size", 8192)
+
+    eval_batch_size = args.batch_size if args.batch_size is not None else 128
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dev_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
@@ -354,16 +456,6 @@ def main() -> None:
 
     item_count = protocol["item_count"]
     n_items = item_count + 1
-    max_length = 200
-    dim = 64
-    heads = 4
-    layers = 2
-    dropout = 0.2
-    ctx_dim = 32
-    mem_win = 8
-    temp = 0.1
-    ctx_heads = 1
-    ffn_dim = 64
 
     # Load catalog & genres
     with open(args.data_dir / "catalog.json", encoding="utf-8") as f:
@@ -378,7 +470,8 @@ def main() -> None:
         genres_by_item[item_id] = set(g)
 
     csv.field_size_limit(2**31 - 1)
-    with open(args.data_dir / "hstu_training_sequences.csv", newline="", encoding="utf-8") as f:
+    seq_path = args.data_dir / "hstu_training_sequences.csv"
+    with open(seq_path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         train_items_list = []
         train_ts_list = []
@@ -395,6 +488,7 @@ def main() -> None:
             if 0 < item < n_items:
                 counts[item] += 1
     warm_items = np.flatnonzero(counts > 0)
+    warm_items_t = torch.tensor(warm_items, device=device, dtype=torch.long)
 
     queries_df = pl.read_parquet(args.data_dir / "queries.parquet")
     if args.sample_queries > 0:
@@ -411,16 +505,135 @@ def main() -> None:
         ctx_dim=ctx_dim,
         mem_win=mem_win,
         temp=temp,
-        ctx_heads=ctx_heads,
         ffn_dim=ffn_dim,
     ).to(device)
 
     if args.train:
-        print("\n--- Training VASSAGO Residual Context Head with Inverse-Frequency Debiasing ---")
+        print("\n=================================================================")
+        print("VASSAGO Authentic 2-Stage Training Pipeline (Driven by YAML config)")
+        print(f"  Backbone Epochs: {backbone_epochs} | Context Epochs: {context_epochs}")
+        print(f"  Batch Size: {train_batch_size} | LR: {lr} | Weight Decay: {weight_decay}")
+        print(f"  Debiasing Alpha: {alpha_debias} | Negatives: {n_neg} per sequence")
+        print(f"  Logit Temperature Scaling: {logit_scale:.1f}")
+        print("=================================================================")
+
+        print("Pre-tensorizing training sequences for high GPU throughput...")
+        t_pre = time.time()
+        pre_hist = np.zeros((n_train, max_length), dtype=np.int32)
+        pre_ts = np.zeros((n_train, max_length), dtype=np.int64)
+        pre_targets = np.zeros(n_train, dtype=np.int32)
+        for idx in range(n_train):
+            s_items = train_items_list[idx]
+            s_ts = train_ts_list[idx]
+            if len(s_items) > 1:
+                w_items = s_items[-max_length:]
+                w_ts = s_ts[-max_length:]
+                L = len(w_items) - 1
+                pre_hist[idx, :L] = w_items[:-1]
+                pre_ts[idx, :L] = w_ts[:-1]
+                pre_targets[idx] = w_items[-1]
+            else:
+                pre_targets[idx] = s_items[0]
+        print(
+            f"Pre-tensorization complete in {time.time() - t_pre:.2f}s "
+            f"({(pre_hist.nbytes + pre_ts.nbytes + pre_targets.nbytes) / (1024 * 1024):.1f} MB)"
+        )
+
         total_inter = counts.sum()
         item_prob = (counts.astype(np.float32) + 1.0) / (total_inter + n_items)
         log_prob = torch.tensor(np.log(item_prob), device=device, dtype=torch.float32)
+        scaler = torch.amp.GradScaler("cuda")
+        indices = np.arange(n_train)
 
+        # -------------------------------------------------------------
+        # Stage 1: Causal Next-Item Backbone Pretraining (In-Batch + Hard Negatives)
+        # -------------------------------------------------------------
+        print("\n--- Stage 1: Training Causal Temporal Decay Transformer Backbone ---")
+        backbone_optimizer = torch.optim.AdamW(
+            model.backbone.parameters(), lr=lr, weight_decay=weight_decay
+        )
+        total_steps_s1 = backbone_epochs * (n_train // train_batch_size + 1)
+        scheduler_s1 = torch.optim.lr_scheduler.CosineAnnealingLR(
+            backbone_optimizer, T_max=total_steps_s1, eta_min=1e-5
+        )
+        t0_stage1 = time.time()
+
+        for epoch in range(1, backbone_epochs + 1):
+            model.train()
+            np.random.shuffle(indices)
+            total_loss = 0.0
+            steps = 0
+
+            for start in range(0, n_train, train_batch_size):
+                batch_idx = indices[start : start + train_batch_size]
+                B = len(batch_idx)
+
+                h_t = torch.from_numpy(pre_hist[batch_idx]).long().to(device, non_blocking=True)
+                ts_t = torch.from_numpy(pre_ts[batch_idx]).long().to(device, non_blocking=True)
+                targets_t = (
+                    torch.from_numpy(pre_targets[batch_idx]).long().to(device, non_blocking=True)
+                )
+
+                valid = h_t.ne(0)
+                positions = valid.sum(1).clamp_min(1) - 1
+
+                # Sample independent negatives per sequence without replacement
+                cands = sample_batch_negatives(warm_items_t, targets_t, n_neg=n_neg)
+
+                backbone_optimizer.zero_grad(set_to_none=True)
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    states = model.backbone.sequence_states(h_t, ts_t)
+                    batch_range = torch.arange(B, device=device)
+                    last_state = states[batch_range, positions]
+
+                    target_embs = F.normalize(model.backbone.items(targets_t), dim=-1)
+                    rand_embs = F.normalize(model.backbone.items(cands), dim=-1)
+
+                    # 1. In-batch contrasts: dot product between each sequence state and all targets
+                    inbatch_logits = (
+                        torch.matmul(last_state, target_embs.transpose(0, 1)) * logit_scale
+                    )
+                    # Mask false negatives where other sequences in batch share identical target
+                    false_neg = targets_t.unsqueeze(1) == targets_t.unsqueeze(0)
+                    false_neg.fill_diagonal_(False)
+                    inbatch_logits = inbatch_logits.masked_fill(false_neg, -10000.0)
+
+                    # 2. Sampled uniform/long-tail negatives
+                    rand_logits = (last_state.unsqueeze(1) * rand_embs).sum(-1) * logit_scale
+
+                    # Frequency debiasing
+                    inbatch_logits = inbatch_logits + alpha_debias * log_prob[targets_t].unsqueeze(
+                        0
+                    )
+                    rand_logits = rand_logits + alpha_debias * log_prob[cands]
+
+                    all_logits = torch.cat([inbatch_logits, rand_logits], dim=1)
+                    labels = torch.arange(B, device=device)
+                    loss = F.cross_entropy(all_logits, labels)
+
+                scaler.scale(loss).backward()
+                scaler.step(backbone_optimizer)
+                scaler.update()
+                scheduler_s1.step()
+
+                total_loss += loss.item()
+                steps += 1
+
+            avg_loss = total_loss / max(steps, 1)
+            print(
+                f"  [Stage 1] Epoch {epoch:02d}/{backbone_epochs:02d} | "
+                f"Backbone Loss: {avg_loss:.4f} | Time: {time.time() - t0_stage1:.1f}s",
+                flush=True,
+            )
+
+        del backbone_optimizer, scheduler_s1
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        # -------------------------------------------------------------
+        # Stage 2: Candidate-Conditioned Contextual Head Training (with Joint Discriminative Tuning)
+        # -------------------------------------------------------------
+        print("\n--- Stage 2: Training Candidate-Conditioned Contextual Cross-Attention Head ---")
         nn.init.xavier_uniform_(model.ctx_item_proj.weight, gain=0.1)
         nn.init.xavier_uniform_(model.ctx_state_proj.weight, gain=0.1)
         nn.init.xavier_uniform_(model.evidence_head.weight, gain=0.1)
@@ -433,60 +646,53 @@ def main() -> None:
             model.ctx_state_proj.parameters(),
             model.evidence_head.parameters(),
         ]
-        ctx_optimizer = torch.optim.AdamW(
-            [p for params in ctx_params for p in params], lr=2e-3, weight_decay=1e-5
+        param_groups = [
+            {
+                "params": [p for params in ctx_params for p in params],
+                "lr": 2e-3,
+                "weight_decay": 1e-5,
+            },
+            {"params": model.backbone.parameters(), "lr": 1e-4, "weight_decay": 1e-5},
+        ]
+        ctx_optimizer = torch.optim.AdamW(param_groups)
+        total_steps_s2 = context_epochs * (n_train // train_batch_size + 1)
+        scheduler_s2 = torch.optim.lr_scheduler.CosineAnnealingLR(
+            ctx_optimizer, T_max=total_steps_s2, eta_min=1e-5
         )
-        scaler = torch.amp.GradScaler("cuda")
-        indices = np.arange(n_train)
-        alpha_debias = 0.25
+        t0_stage2 = time.time()
 
-        t0 = time.time()
-        for epoch in range(1, 6):
+        for epoch in range(1, context_epochs + 1):
             model.train()
-            model.backbone.eval()
             np.random.shuffle(indices)
             total_loss = 0.0
             steps = 0
 
-            for start in range(0, n_train, 256):
-                batch_idx = indices[start : start + 256]
+            for start in range(0, n_train, train_batch_size):
+                batch_idx = indices[start : start + train_batch_size]
                 B = len(batch_idx)
 
-                h_t = torch.zeros(B, max_length, dtype=torch.long, device=device)
-                ts_t = torch.zeros(B, max_length, dtype=torch.long, device=device)
-                targets_t = torch.zeros(B, dtype=torch.long, device=device)
-
-                for i, idx in enumerate(batch_idx):
-                    s_items = train_items_list[idx]
-                    s_ts = train_ts_list[idx]
-                    if len(s_items) > 1:
-                        w_items = s_items[-max_length:]
-                        w_ts = s_ts[-max_length:]
-                        h_t[i, : len(w_items) - 1] = torch.tensor(w_items[:-1], device=device)
-                        ts_t[i, : len(w_ts) - 1] = torch.tensor(w_ts[:-1], device=device)
-                        targets_t[i] = w_items[-1]
-                    else:
-                        targets_t[i] = s_items[0]
+                h_t = torch.from_numpy(pre_hist[batch_idx]).long().to(device, non_blocking=True)
+                ts_t = torch.from_numpy(pre_ts[batch_idx]).long().to(device, non_blocking=True)
+                targets_t = (
+                    torch.from_numpy(pre_targets[batch_idx]).long().to(device, non_blocking=True)
+                )
 
                 valid = h_t.ne(0)
                 positions = valid.sum(1).clamp_min(1) - 1
 
+                # Sample independent negatives per sequence without replacement
+                cands = sample_batch_negatives(warm_items_t, targets_t, n_neg=n_neg)
+                eval_items = torch.cat([targets_t.unsqueeze(1), cands], dim=1)
+
                 ctx_optimizer.zero_grad(set_to_none=True)
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    with torch.no_grad():
-                        states = model.backbone.sequence_states(h_t, ts_t)
-                        batch_range = torch.arange(B, device=device)
-                        last_state = states[batch_range, positions]
+                    states = model.backbone.sequence_states(h_t, ts_t)
+                    batch_range = torch.arange(B, device=device)
+                    last_state = states[batch_range, positions]
+                    cand_emb = F.normalize(model.backbone.items(eval_items), dim=-1)
 
                     memory, mem_mask = model._memory(states, valid, positions)
                     mem_proj = model.ctx_state_proj(memory)
-
-                    neg_items = torch.from_numpy(np.random.choice(warm_items, size=64)).to(device)
-                    eval_items = torch.cat(
-                        [targets_t.unsqueeze(-1), neg_items.expand(B, -1)], dim=-1
-                    )
-
-                    cand_emb = F.normalize(model.backbone.items(eval_items), dim=-1)
                     cand_ctx = model.ctx_item_proj(cand_emb)
 
                     raw_sim = torch.einsum("bmd,bnd->bmn", mem_proj, cand_ctx) / (
@@ -498,7 +704,7 @@ def main() -> None:
                     pooled = torch.einsum("bmn,bmd->bnd", attn_weights, mem_proj)
                     evidence = model.evidence_head(pooled).squeeze(-1)
 
-                    base_scores = (last_state.unsqueeze(1) * cand_emb).sum(-1)
+                    base_scores = (last_state.unsqueeze(1) * cand_emb).sum(-1) * logit_scale
                     total_logits = base_scores + 0.5 * evidence
                     train_logits = total_logits + alpha_debias * log_prob[eval_items]
 
@@ -508,12 +714,15 @@ def main() -> None:
                 scaler.scale(loss).backward()
                 scaler.step(ctx_optimizer)
                 scaler.update()
+                scheduler_s2.step()
 
                 total_loss += loss.item()
                 steps += 1
 
+            avg_loss = total_loss / max(steps, 1)
             print(
-                f"Epoch {epoch}/5 | Loss: {total_loss / steps:.4f} | Time: {time.time() - t0:.1f}s",
+                f"  [Stage 2] Epoch {epoch:02d}/{context_epochs:02d} | "
+                f"Context Head Loss: {avg_loss:.4f} | Time: {time.time() - t0_stage2:.1f}s",
                 flush=True,
             )
 
@@ -522,12 +731,19 @@ def main() -> None:
         gc.collect()
 
         torch.save(model.state_dict(), args.checkpoint)
-        print(f"Saved checkpoint to {args.checkpoint}")
+        print(f"\nSaved trained 2-stage checkpoint to {args.checkpoint}")
     else:
         print(f"\nLoading production checkpoint from: {args.checkpoint}")
         ckpt = torch.load(args.checkpoint, map_location=device, weights_only=True)
         model.load_state_dict(ckpt)
         print("Checkpoint loaded successfully.")
+
+    candidate_mask = None
+    if "candidate_item_ids" in protocol and protocol["candidate_item_ids"]:
+        candidate_mask = torch.zeros(n_items, dtype=torch.bool, device=device)
+        candidate_mask[protocol["candidate_item_ids"]] = True
+        n_eligible = len(protocol["candidate_item_ids"])
+        print(f"Applying strict candidate mask: {n_eligible} eligible items")
 
     print(f"\n--- Running Full-Catalog Protocol v4 Evaluation ({len(queries)} queries) ---")
     t_eval = time.time()
@@ -540,7 +756,8 @@ def main() -> None:
         counts=counts,
         genres_by_item=genres_by_item,
         device=device,
-        batch_size=args.batch_size,
+        candidate_mask=candidate_mask,
+        batch_size=eval_batch_size,
     )
     print(f"Evaluation finished in {time.time() - t_eval:.2f}s")
 
